@@ -102,6 +102,7 @@ Thumbs.db
 
 # Archivos de texto convertidos
 *.txt
+!requirements.txt
 *.doc
 *.docx
 *.rtf

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import os
+import queue
+import shutil
 import sys
 import threading
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -25,10 +29,18 @@ _whisper_error: Optional[Exception] = None
 
 
 APP_TITLE = "Video a Texto - Whisper"
-WINDOW_SIZE = (760, 520)
+WINDOW_SIZE = (920, 700)
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
-DEFAULT_MODEL = "large"
+DEFAULT_MODEL = "turbo"
 DEFAULT_LANG = "es"
+MODEL_HINTS = {
+    "turbo": "Recomendado · rápido y muy preciso",
+    "large-v3": "Máxima precisión · mayor uso de memoria",
+    "medium": "Buen equilibrio para equipos intermedios",
+    "small": "Ligero · menor precisión",
+    "base": "Muy ligero · ideal para pruebas",
+    "tiny": "El más rápido · precisión básica",
+}
 
 
 def load_torch():
@@ -122,8 +134,33 @@ def resolve_video_file(video_file: Path) -> Path:
     return video_file
 
 
+def require_ffmpeg() -> str:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError(
+            "No se encontró FFmpeg. Instálalo y asegúrate de que el comando "
+            "'ffmpeg' esté disponible en PowerShell."
+        )
+    return ffmpeg_path
+
+
+def normalize_language(whisper_module, language: str) -> Optional[str]:
+    language = language.strip().lower()
+    if language in {"", "auto", "automático", "automatico"}:
+        return None
+
+    tokenizer = whisper_module.tokenizer
+    language = tokenizer.TO_LANGUAGE_CODE.get(language, language)
+    if language not in tokenizer.LANGUAGES:
+        raise ValueError(
+            f"Idioma no reconocido: {language!r}. Usa un código como 'es', 'en' "
+            "o escribe 'auto' para detectarlo."
+        )
+    return language
+
+
 def srt_timestamp(seconds: float) -> str:
-    total_ms = int(round(seconds * 1000))
+    total_ms = max(0, int(round(seconds * 1000)))
     hours, rem = divmod(total_ms, 3600_000)
     minutes, rem = divmod(rem, 60_000)
     secs, ms = divmod(rem, 1000)
@@ -131,9 +168,51 @@ def srt_timestamp(seconds: float) -> str:
 
 
 def write_windows_text(path: Path, content: str) -> None:
+    """Escribe UTF-8 con finales CRLF sin dejar un archivo parcial."""
     normalized = content.replace("\r\n", "\n").replace("\r", "\n")
-    with path.open("w", encoding="utf-8", newline="") as f:
-        f.write(normalized.replace("\n", "\r\n"))
+    temp_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="") as f:
+            f.write(normalized.replace("\n", "\r\n"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def build_transcript_outputs(result: dict) -> tuple[str, str]:
+    """Construye TXT y SRT, descartando segmentos vacíos o mal formados."""
+    valid_segments: list[tuple[float, float, str]] = []
+    for segment in result.get("segments") or []:
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start = max(0.0, float(segment["start"]))
+            end = max(start, float(segment["end"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        valid_segments.append((start, end, text))
+
+    transcript = str(result.get("text") or "").strip()
+    if not transcript:
+        transcript = " ".join(text for _, _, text in valid_segments)
+
+    srt_lines: list[str] = []
+    for index, (start, end, text) in enumerate(valid_segments, start=1):
+        srt_lines.extend(
+            (
+                str(index),
+                f"{srt_timestamp(start)} --> {srt_timestamp(end)}",
+                text,
+                "",
+            )
+        )
+
+    txt_content = f"{transcript}\n" if transcript else ""
+    srt_content = "\n".join(srt_lines)
+    return txt_content, srt_content
 
 
 class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
@@ -146,14 +225,24 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
         self._selected_file: Optional[Path] = None
         self._running = False
+        self._closing = False
+        self._main_thread_id = threading.get_ident()
+        self._ui_queue: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
+        self._loaded_model = None
+        self._loaded_model_key: Optional[tuple[str, str]] = None
 
         self.var_model = tk.StringVar(value=DEFAULT_MODEL)
         self.var_lang = tk.StringVar(value=DEFAULT_LANG)
         self.var_device = tk.StringVar(value="auto")
         self.var_fp16 = tk.BooleanVar(value=True)
+        self.var_prompt = tk.StringVar()
 
         self._build_ui()
         self._center_window()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Control-o>", self._shortcut_select)
+        self.bind("<Control-Return>", self._shortcut_process)
+        self.after(50, self._drain_ui_queue)
 
     def _apply_theme(self) -> None:
         style = ttk.Style(self)
@@ -164,43 +253,67 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             except Exception:
                 continue
 
+        style.configure("Title.TLabel", font=("Segoe UI", 20, "bold"))
+        style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground="#5f6368")
+        style.configure("Section.TLabelframe", padding=14)
+        style.configure("Section.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+        style.configure("Field.TLabel", font=("Segoe UI", 9, "bold"))
+        style.configure("Hint.TLabel", font=("Segoe UI", 9), foreground="#5f6368")
+        style.configure("File.TLabel", font=("Segoe UI", 9), foreground="#394457")
+        style.configure("Drop.TLabel", font=("Segoe UI", 11, "bold"), padding=(18, 22))
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"), padding=(18, 8))
+        style.configure("Status.TLabel", font=("Segoe UI", 10, "bold"), foreground="#305f8f")
+        style.configure("Success.Status.TLabel", foreground="#19733b")
+        style.configure("Error.Status.TLabel", foreground="#b42318")
+
     def _center_window(self) -> None:
         self.update_idletasks()
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
-        width = min(WINDOW_SIZE[0], max(680, sw - 80))
-        height = min(WINDOW_SIZE[1], max(480, sh - 120))
-        self.minsize(width, height)
-        self.resizable(False, False)
+        width = min(WINDOW_SIZE[0], max(760, sw - 80))
+        height = min(WINDOW_SIZE[1], max(620, sh - 100))
+        self.minsize(760, 620)
+        self.resizable(True, True)
         pos_x = (sw // 2) - (width // 2)
         pos_y = (sh // 2) - (height // 2)
         self.geometry(f"{width}x{height}+{max(0, pos_x)}+{max(0, pos_y)}")
 
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=12)
+        root = ttk.Frame(self, padding=20)
         root.pack(fill="both", expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(4, weight=1)
 
-        ttk.Label(root, text=APP_TITLE, font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        header = ttk.Frame(root)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Video a Texto", style="Title.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
         ttk.Label(
-            root,
-            text="Arrastra un video o selecciónalo manualmente. "
-            "El archivo .txt y .srt se generará en la misma carpeta del video.",
-            foreground="#444444",
-            wraplength=700,
-            justify="left",
-        ).pack(anchor="w", pady=(4, 10))
+            header,
+            text="Transcripción local con Whisper · genera TXT y SRT junto al video",
+            style="Subtitle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(header, text="Ctrl+O  Abrir   ·   Ctrl+Enter  Procesar", style="Hint.TLabel").grid(
+            row=0, column=1, rowspan=2, sticky="e"
+        )
 
-        file_box = ttk.LabelFrame(root, text="Archivo", padding=10)
-        file_box.pack(fill="x")
+        file_box = ttk.LabelFrame(root, text="1  Selecciona el video", style="Section.TLabelframe")
+        file_box.grid(row=1, column=0, sticky="ew")
+        file_box.columnconfigure(0, weight=1)
 
         self.lbl_drop = ttk.Label(
             file_box,
-            text="Suelta aquí el video (.mp4, .mkv, .mov, .avi, .webm)",
+            text="Arrastra el video aquí\no haz clic para buscarlo",
             anchor="center",
             relief="groove",
-            padding=(10, 16),
+            justify="center",
+            cursor="hand2",
+            style="Drop.TLabel",
         )
-        self.lbl_drop.pack(fill="x")
+        self.lbl_drop.grid(row=0, column=0, sticky="ew")
+        self.lbl_drop.bind("<Button-1>", self._on_drop_click)
 
         if TkinterDnD is not None:
             try:
@@ -209,58 +322,94 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             except Exception:
                 pass
 
-        self.lbl_file = ttk.Label(file_box, text="Archivo: (ninguno)")
-        self.lbl_file.pack(anchor="w", pady=(8, 0))
+        self.lbl_file = ttk.Label(
+            file_box,
+            text="Ningún archivo seleccionado · MP4, MKV, MOV, AVI o WEBM",
+            style="File.TLabel",
+            anchor="w",
+            wraplength=820,
+        )
+        self.lbl_file.grid(row=1, column=0, sticky="ew", pady=(10, 0))
 
-        options = ttk.LabelFrame(root, text="Configuración", padding=10)
-        options.pack(fill="x", pady=(10, 0))
+        options = ttk.LabelFrame(
+            root, text="2  Configura la transcripción", style="Section.TLabelframe"
+        )
+        options.grid(row=2, column=0, sticky="ew", pady=(14, 0))
 
+        options.columnconfigure(0, weight=1)
         options.columnconfigure(1, weight=1)
+        options.columnconfigure(2, weight=1)
         options.columnconfigure(3, weight=1)
 
-        ttk.Label(options, text="Modelo").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(options, text="Modelo", style="Field.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
         self.cmb_model = ttk.Combobox(
             options,
             textvariable=self.var_model,
             state="readonly",
-            values=("tiny", "base", "small", "medium", "large"),
+            values=("turbo", "large-v3", "medium", "small", "base", "tiny"),
         )
-        self.cmb_model.grid(row=0, column=1, sticky="ew", pady=4)
+        self.cmb_model.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(4, 0))
+        self.lbl_model_hint = ttk.Label(
+            options, text=MODEL_HINTS[DEFAULT_MODEL], style="Hint.TLabel"
+        )
+        self.lbl_model_hint.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(3, 10))
+        self.cmb_model.bind("<<ComboboxSelected>>", self._update_model_hint)
 
-        ttk.Label(options, text="Idioma").grid(row=0, column=2, sticky="w", padx=(16, 8), pady=4)
+        ttk.Label(options, text="Idioma", style="Field.TLabel").grid(
+            row=0, column=1, sticky="w", padx=8
+        )
         self.ent_lang = ttk.Entry(options, textvariable=self.var_lang)
-        self.ent_lang.grid(row=0, column=3, sticky="ew", pady=4)
+        self.ent_lang.grid(row=1, column=1, sticky="ew", padx=8, pady=(4, 0))
+        ttk.Label(options, text="Código: es, en o auto", style="Hint.TLabel").grid(
+            row=2, column=1, sticky="w", padx=8, pady=(3, 10)
+        )
 
-        ttk.Label(options, text="Dispositivo").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(options, text="Dispositivo", style="Field.TLabel").grid(
+            row=0, column=2, sticky="w", padx=8
+        )
         self.cmb_device = ttk.Combobox(
             options,
             textvariable=self.var_device,
             state="readonly",
             values=("auto", "cuda", "cpu"),
         )
-        self.cmb_device.grid(row=1, column=1, sticky="ew", pady=4)
+        self.cmb_device.grid(row=1, column=2, sticky="ew", padx=8, pady=(4, 0))
+        ttk.Label(options, text="Auto usa CUDA si está disponible", style="Hint.TLabel").grid(
+            row=2, column=2, sticky="w", padx=8, pady=(3, 10)
+        )
 
         self.chk_fp16 = ttk.Checkbutton(
             options,
-            text="Usar FP16 en GPU",
+            text="Aceleración FP16",
             variable=self.var_fp16,
         )
-        self.chk_fp16.grid(row=1, column=3, sticky="w", pady=4)
+        self.chk_fp16.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(4, 0))
+        ttk.Label(options, text="Menos memoria y mayor velocidad", style="Hint.TLabel").grid(
+            row=2, column=3, sticky="w", padx=(8, 0), pady=(3, 10)
+        )
 
-        progress_box = ttk.LabelFrame(root, text="Progreso", padding=10)
-        progress_box.pack(fill="x", pady=(10, 0))
-
-        self.lbl_status = ttk.Label(progress_box, text="Estado: Listo")
-        self.lbl_status.pack(anchor="w")
-
-        self.pbar = ttk.Progressbar(progress_box, orient="horizontal", mode="indeterminate")
-        self.pbar.pack(fill="x", pady=(8, 0))
+        ttk.Label(options, text="Contexto opcional", style="Field.TLabel").grid(
+            row=3, column=0, columnspan=4, sticky="w"
+        )
+        self.ent_prompt = ttk.Entry(
+            options,
+            textvariable=self.var_prompt,
+        )
+        self.ent_prompt.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(4, 0))
+        ttk.Label(
+            options,
+            text="Ejemplo: Azure OpenAI, FastAPI, nombres propios o vocabulario técnico",
+            style="Hint.TLabel",
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(3, 0))
 
         actions = ttk.Frame(root)
-        actions.pack(fill="x", pady=(10, 0))
+        actions.grid(row=3, column=0, sticky="ew", pady=14)
+        actions.columnconfigure(2, weight=1)
 
-        self.btn_select = ttk.Button(actions, text="Buscar video", command=self._on_select_file)
-        self.btn_select.pack(side="left")
+        self.btn_select = ttk.Button(actions, text="Cambiar video", command=self._on_select_file)
+        self.btn_select.grid(row=0, column=0, sticky="w")
 
         self.btn_open_folder = ttk.Button(
             actions,
@@ -268,30 +417,118 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             command=self._on_open_folder,
             state="disabled",
         )
-        self.btn_open_folder.pack(side="left", padx=(8, 0))
+        self.btn_open_folder.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
         self.btn_process = ttk.Button(
             actions,
-            text="Procesar",
+            text="Transcribir video",
             command=self._on_process,
             state="disabled",
+            style="Accent.TButton",
         )
-        self.btn_process.pack(side="right")
+        self.btn_process.grid(row=0, column=3, sticky="e")
 
-        console_box = ttk.LabelFrame(root, text="Consola", padding=10)
-        console_box.pack(fill="both", expand=True, pady=(10, 0))
+        console_box = ttk.LabelFrame(root, text="3  Progreso", style="Section.TLabelframe")
+        console_box.grid(row=4, column=0, sticky="nsew")
+        console_box.columnconfigure(0, weight=1)
+        console_box.rowconfigure(2, weight=1)
+
+        progress_header = ttk.Frame(console_box)
+        progress_header.grid(row=0, column=0, sticky="ew")
+        progress_header.columnconfigure(0, weight=1)
+        self.lbl_status = ttk.Label(progress_header, text="Listo", style="Success.Status.TLabel")
+        self.lbl_status.grid(row=0, column=0, sticky="w")
+        ttk.Button(progress_header, text="Limpiar registro", command=self._clear_console).grid(
+            row=0, column=1, sticky="e"
+        )
+
+        self.pbar = ttk.Progressbar(console_box, orient="horizontal", mode="indeterminate")
+        self.pbar.grid(row=1, column=0, sticky="ew", pady=(10, 10))
 
         self.txt_console = ScrolledText(console_box, height=12, wrap="word", state="disabled")
-        self.txt_console.pack(fill="both", expand=True)
+        self.txt_console.grid(row=2, column=0, sticky="nsew")
+        self.txt_console.configure(
+            font=("Cascadia Mono", 9),
+            background="#111827",
+            foreground="#dbe5f1",
+            insertbackground="#ffffff",
+            relief="flat",
+            padx=10,
+            pady=8,
+        )
 
         if TkinterDnD is None:
             self._append_console(
                 "Arrastrar y soltar no está disponible porque tkinterdnd2 no está instalado. "
-                "Puedes usar el botón 'Buscar video'."
+                "Haz clic en la zona de selección para buscar el video."
             )
 
-    def _ui(self, fn) -> None:
-        self.after(0, fn)
+    def _shortcut_select(self, _event=None) -> str:
+        if not self._running:
+            self._on_select_file()
+        return "break"
+
+    def _shortcut_process(self, _event=None) -> str:
+        self._on_process()
+        return "break"
+
+    def _on_drop_click(self, _event=None) -> None:
+        if not self._running:
+            self._on_select_file()
+
+    def _update_model_hint(self, _event=None) -> None:
+        model = self.var_model.get()
+        self.lbl_model_hint.config(text=MODEL_HINTS.get(model, "Modelo Whisper"))
+
+    def _clear_console(self) -> None:
+        self.txt_console.config(state="normal")
+        self.txt_console.delete("1.0", "end")
+        self.txt_console.config(state="disabled")
+
+    def _ui(self, fn: Callable[[], None]) -> None:
+        """Ejecuta cambios de interfaz únicamente desde el hilo de Tkinter."""
+        if self._closing:
+            return
+        if threading.get_ident() == self._main_thread_id:
+            fn()
+        else:
+            self._ui_queue.put(fn)
+
+    def _drain_ui_queue(self) -> None:
+        if self._closing:
+            return
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except tk.TclError:
+                if not self._closing:
+                    raise
+        self.after(50, self._drain_ui_queue)
+
+    def _on_close(self) -> None:
+        if self._running and not messagebox.askyesno(
+            APP_TITLE,
+            "Hay una transcripción en curso. Si cierras ahora, el proceso se cancelará.\n\n"
+            "¿Deseas cerrar la aplicación?",
+            parent=self,
+        ):
+            return
+        self.close()
+
+    def close(self) -> None:
+        """Cierra la aplicación e ignora actualizaciones tardías del worker."""
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            self.pbar.stop()
+        except tk.TclError:
+            pass
+        self.destroy()
 
     def _append_console(self, message: str) -> None:
         def _append() -> None:
@@ -312,6 +549,11 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.btn_process.config(
             state=("disabled" if busy or self._selected_file is None else "normal")
         )
+        self.cmb_model.config(state="disabled" if busy else "readonly")
+        self.cmb_device.config(state="disabled" if busy else "readonly")
+        self.ent_lang.config(state="disabled" if busy else "normal")
+        self.ent_prompt.config(state="disabled" if busy else "normal")
+        self.chk_fp16.config(state="disabled" if busy else "normal")
 
         try:
             self.lbl_drop.config(state=state_normal)
@@ -324,7 +566,15 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             self.pbar.stop()
 
     def _set_status(self, text: str) -> None:
-        self._ui(lambda: self.lbl_status.config(text=f"Estado: {text}"))
+        def _apply() -> None:
+            style = "Status.TLabel"
+            if "error" in text.lower():
+                style = "Error.Status.TLabel"
+            elif any(word in text.lower() for word in ("listo", "éxito", "terminado")):
+                style = "Success.Status.TLabel"
+            self.lbl_status.config(text=text, style=style)
+
+        self._ui(_apply)
 
     def _on_drop_file(self, event) -> None:
         path_str = _parse_drop_file(self, getattr(event, "data", "") or "")
@@ -353,7 +603,8 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             return
 
         self._selected_file = path
-        self.lbl_file.config(text=f"Archivo: {path}")
+        size_mb = path.stat().st_size / (1024**2)
+        self.lbl_file.config(text=f"{path.name}  ·  {size_mb:.1f} MB\n{path.parent}")
         self.btn_process.config(state="normal" if not self._running else "disabled")
         self.btn_open_folder.config(state="normal" if not self._running else "disabled")
         self._set_status("Archivo listo para procesar")
@@ -378,13 +629,21 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self._set_busy(True)
         self._set_status("Procesando")
         self._append_console("Iniciando transcripción...")
-        worker = threading.Thread(target=self._worker_process, daemon=True)
-        worker.start()
-
-    def _resolve_device(self) -> tuple[str, bool]:
+        video_file = self._selected_file
+        model_size = self.var_model.get().strip() or DEFAULT_MODEL
+        lang = self.var_lang.get().strip() or DEFAULT_LANG
+        initial_prompt = self.var_prompt.get().strip() or None
         requested_device = self.var_device.get().strip().lower() or "auto"
         use_fp16 = bool(self.var_fp16.get())
+        worker = threading.Thread(
+            target=self._worker_process,
+            args=(video_file, model_size, lang, requested_device, use_fp16, initial_prompt),
+            daemon=True,
+            name="whisper-transcription",
+        )
+        worker.start()
 
+    def _resolve_device(self, requested_device: str, use_fp16: bool) -> tuple[str, bool]:
         torch_module = load_torch()
 
         cuda_available = bool(torch_module.cuda.is_available())
@@ -407,57 +666,87 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
         return device, use_fp16
 
-    def _worker_process(self) -> None:
+    def _get_model(self, whisper_module, model_size: str, device: str):
+        model_key = (model_size, device)
+        if self._loaded_model is not None and self._loaded_model_key == model_key:
+            self._append_console("Reutilizando el modelo cargado en memoria.")
+            return self._loaded_model
+
+        if self._loaded_model is not None:
+            self._append_console("Liberando el modelo anterior...")
+            self._loaded_model = None
+            self._loaded_model_key = None
+            gc.collect()
+            torch_module = load_torch()
+            if torch_module.cuda.is_available():
+                torch_module.cuda.empty_cache()
+
+        model = whisper_module.load_model(model_size, device=device)
+        self._loaded_model = model
+        self._loaded_model_key = model_key
+        return model
+
+    def _worker_process(
+        self,
+        video_file: Path,
+        model_size: str,
+        lang: str,
+        requested_device: str,
+        use_fp16: bool,
+        initial_prompt: Optional[str],
+    ) -> None:
+        started_at = time.perf_counter()
+        device = "cpu"
         try:
             self._set_status("Cargando dependencias")
             self._append_console("Cargando dependencias (torch/whisper)...")
             whisper_module = load_whisper()
 
-            video_file = resolve_video_file(self._selected_file)
-            model_size = self.var_model.get().strip() or DEFAULT_MODEL
-            lang = self.var_lang.get().strip() or DEFAULT_LANG
-            device, use_fp16 = self._resolve_device()
+            video_file = resolve_video_file(video_file)
+            require_ffmpeg()
+            language = normalize_language(whisper_module, lang)
+            device, use_fp16 = self._resolve_device(requested_device, use_fp16)
 
             self._append_console(f"Video: {video_file.name}")
             self._append_console(f"Modelo: {model_size}")
-            self._append_console(f"Idioma: {lang}")
+            self._append_console(f"Tamaño: {video_file.stat().st_size / (1024 ** 2):.1f} MB")
+            self._append_console(f"Idioma: {language or 'detección automática'}")
             self._append_console(f"Dispositivo: {device}")
             self._append_console(f"FP16: {'Sí' if use_fp16 else 'No'}")
+            if initial_prompt:
+                self._append_console("Se usará el contexto indicado para nombres y vocabulario.")
+
+            torch_module = load_torch()
+            if device == "cuda":
+                self._append_console(f"GPU: {torch_module.cuda.get_device_name(0)}")
 
             self._set_status("Cargando modelo")
             self._append_console("Cargando modelo Whisper...")
-            model = whisper_module.load_model(model_size, device=device)
+            model = self._get_model(whisper_module, model_size, device)
 
             self._set_status("Transcribiendo audio")
             self._append_console("Transcribiendo video...")
-            result = model.transcribe(
-                str(video_file),
-                language=lang,
-                fp16=use_fp16,
-                word_timestamps=False,
-            )
+            with torch_module.inference_mode():
+                result = model.transcribe(
+                    str(video_file),
+                    language=language,
+                    fp16=use_fp16,
+                    initial_prompt=initial_prompt,
+                    word_timestamps=False,
+                    verbose=None,
+                )
 
             txt_file = video_file.with_suffix(".txt")
             srt_file = video_file.with_suffix(".srt")
 
-            self._set_status("Escribiendo TXT")
-            transcript = (result.get("text") or "").strip()
-            write_windows_text(txt_file, transcript + "\n")
-
-            self._set_status("Escribiendo SRT")
-            srt_lines: list[str] = []
-            for idx, seg in enumerate(result.get("segments", []), start=1):
-                srt_lines.append(str(idx))
-                srt_lines.append(
-                    f"{srt_timestamp(float(seg['start']))} --> {srt_timestamp(float(seg['end']))}"
-                )
-                srt_lines.append(str(seg.get("text", "")).strip())
-                srt_lines.append("")
-
-            write_windows_text(srt_file, "\n".join(srt_lines))
+            self._set_status("Guardando resultados")
+            txt_content, srt_content = build_transcript_outputs(result)
+            write_windows_text(txt_file, txt_content)
+            write_windows_text(srt_file, srt_content)
 
             self._append_console(f"TXT generado: {txt_file}")
             self._append_console(f"SRT generado: {srt_file}")
+            self._append_console(f"Tiempo total: {time.perf_counter() - started_at:.1f} s")
             self._set_status("Proceso terminado con éxito")
 
             self._ui(
@@ -470,9 +759,16 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                 )
             )
         except Exception as exc:
-            self._append_console(f"Error: {exc}")
+            error_message = str(exc)
+            if "out of memory" in error_message.lower():
+                error_message = (
+                    "La GPU se quedó sin memoria. Prueba el modelo 'turbo' o uno más pequeño."
+                )
+                if device == "cuda":
+                    load_torch().cuda.empty_cache()
+            self._append_console(f"Error: {error_message}")
             self._set_status("Error")
-            self._ui(lambda msg=str(exc): messagebox.showerror(APP_TITLE, msg, parent=self))
+            self._ui(lambda msg=error_message: messagebox.showerror(APP_TITLE, msg, parent=self))
         finally:
             self._ui(lambda: self._set_busy(False))
 
@@ -480,7 +776,11 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 def main() -> None:
     _windows_set_dpi_awareness()
     app = Video2TextApp()
-    app.mainloop()
+    try:
+        app.mainloop()
+    except KeyboardInterrupt:
+        # Ctrl+C es una solicitud de cierre, no un error de la aplicación.
+        app.close()
 
 
 if __name__ == "__main__":
