@@ -1,2 +1,4 @@
+# Versión de Whisper validada con Python 3.12 y PyTorch 2.5.1+cu121.
+# PyTorch se instala por separado para conservar la variante CUDA correcta.
 openai-whisper==20250625
 tkinterdnd2==0.6.2

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import ctypes
 import gc
+import json
 import os
 import queue
 import shutil
+import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -47,6 +50,20 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 SUPPORTED_MEDIA_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS | SUPPORTED_AUDIO_EXTENSIONS
 DEFAULT_MODEL = "turbo"
 DEFAULT_LANG = "es"
+LANGUAGE_ALIASES = {
+    "alemán": "de",
+    "aleman": "de",
+    "castellano": "es",
+    "español": "es",
+    "espanol": "es",
+    "francés": "fr",
+    "frances": "fr",
+    "inglés": "en",
+    "ingles": "en",
+    "italiano": "it",
+    "portugués": "pt",
+    "portugues": "pt",
+}
 MODEL_HINTS = {
     "turbo": "Recomendado · rápido y muy preciso",
     "large-v3": "Máxima precisión · mayor uso de memoria",
@@ -55,6 +72,22 @@ MODEL_HINTS = {
     "base": "Muy ligero · ideal para pruebas",
     "tiny": "El más rápido · precisión básica",
 }
+
+
+def bundled_resource(name: str) -> Path:
+    """Resuelve recursos tanto en código fuente como dentro de PyInstaller."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    base_path = Path(bundle_root) if bundle_root else Path(__file__).resolve().parent
+    return base_path / name
+
+
+def find_media_binary(name: str) -> Optional[str]:
+    """Localiza FFmpeg/FFprobe incluidos en el EXE o disponibles en PATH."""
+    executable_name = f"{name}.exe" if sys.platform == "win32" else name
+    packaged_binary = bundled_resource(executable_name)
+    if packaged_binary.is_file():
+        return str(packaged_binary)
+    return shutil.which(name)
 
 
 def load_torch():
@@ -154,7 +187,7 @@ def resolve_video_file(video_file: Path) -> Path:
 
 
 def require_ffmpeg() -> str:
-    ffmpeg_path = shutil.which("ffmpeg")
+    ffmpeg_path = find_media_binary("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError(
             "No se encontró FFmpeg. Instálalo y asegúrate de que el comando "
@@ -163,11 +196,67 @@ def require_ffmpeg() -> str:
     return ffmpeg_path
 
 
+def require_ffprobe() -> str:
+    ffprobe_path = find_media_binary("ffprobe")
+    if ffprobe_path is None:
+        raise RuntimeError(
+            "No se encontró FFprobe. Instala FFmpeg completo y asegúrate de que "
+            "el comando 'ffprobe' esté disponible en PowerShell."
+        )
+    return ffprobe_path
+
+
+def probe_audio_stream(media_file: Path, ffprobe_path: Optional[str] = None) -> dict:
+    """Comprueba que FFmpeg pueda leer al menos una pista de audio."""
+    command = [
+        ffprobe_path or require_ffprobe(),
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=index,codec_name,channels,sample_rate",
+        "-of",
+        "json",
+        str(media_file),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(
+            f"FFprobe agotó el tiempo al analizar el archivo: {media_file.name}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"No se pudo ejecutar FFprobe: {exc}") from exc
+
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "FFprobe no pudo leer el archivo."
+        raise ValueError(f"Archivo multimedia inválido o dañado: {detail}")
+
+    try:
+        streams = json.loads(completed.stdout or "{}").get("streams") or []
+    except (json.JSONDecodeError, AttributeError) as exc:
+        raise ValueError("FFprobe devolvió una respuesta inválida.") from exc
+
+    if not streams:
+        raise ValueError("El archivo no contiene una pista de audio decodificable.")
+    return streams[0]
+
+
 def normalize_language(whisper_module, language: str) -> Optional[str]:
     language = language.strip().lower()
     if language in {"", "auto", "automático", "automatico"}:
         return None
 
+    language = LANGUAGE_ALIASES.get(language, language)
     tokenizer = whisper_module.tokenizer
     language = tokenizer.TO_LANGUAGE_CODE.get(language, language)
     if language not in tokenizer.LANGUAGES:
@@ -234,12 +323,41 @@ def build_transcript_outputs(result: dict) -> tuple[str, str]:
     return txt_content, srt_content
 
 
+def transcribe_media(
+    model,
+    media_file: Path,
+    language: Optional[str],
+    use_fp16: bool,
+    initial_prompt: Optional[str],
+) -> dict:
+    """Ejecuta Whisper sin depender de la interfaz gráfica."""
+    return model.transcribe(
+        str(media_file),
+        language=language,
+        fp16=use_fp16,
+        initial_prompt=initial_prompt,
+        word_timestamps=False,
+        verbose=None,
+    )
+
+
+def save_transcript_outputs(media_file: Path, result: dict) -> tuple[Path, Path]:
+    """Guarda las salidas de una transcripción junto al archivo original."""
+    txt_file = media_file.with_suffix(".txt")
+    srt_file = media_file.with_suffix(".srt")
+    txt_content, srt_content = build_transcript_outputs(result)
+    write_windows_text(txt_file, txt_content)
+    write_windows_text(srt_file, srt_content)
+    return txt_file, srt_file
+
+
 class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         _normalize_tk_scaling_to_96dpi(self)
 
         self.title(APP_TITLE)
+        self._apply_window_icon()
         self._apply_theme()
 
         self._selected_file: Optional[Path] = None
@@ -262,6 +380,15 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.bind("<Control-o>", self._shortcut_select)
         self.bind("<Control-Return>", self._shortcut_process)
         self.after(50, self._drain_ui_queue)
+
+    def _apply_window_icon(self) -> None:
+        icon_path = bundled_resource("totext.ico")
+        if not icon_path.is_file():
+            return
+        try:
+            self.iconbitmap(default=str(icon_path))
+        except tk.TclError:
+            pass
 
     def _apply_theme(self) -> None:
         style = ttk.Style(self)
@@ -383,9 +510,11 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         )
         self.ent_lang = ttk.Entry(options, textvariable=self.var_lang)
         self.ent_lang.grid(row=1, column=1, sticky="ew", padx=8, pady=(4, 0))
-        ttk.Label(options, text="Código: es, en o auto", style="Hint.TLabel").grid(
-            row=2, column=1, sticky="w", padx=8, pady=(3, 10)
-        )
+        ttk.Label(
+            options,
+            text="Código o nombre: es, español, en o auto",
+            style="Hint.TLabel",
+        ).grid(row=2, column=1, sticky="w", padx=8, pady=(3, 10))
 
         ttk.Label(options, text="Dispositivo", style="Field.TLabel").grid(
             row=0, column=2, sticky="w", padx=8
@@ -733,6 +862,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
             media_file = resolve_media_file(media_file)
             require_ffmpeg()
+            audio_stream = probe_audio_stream(media_file)
             language = normalize_language(whisper_module, lang)
             device, use_fp16 = self._resolve_device(requested_device, use_fp16)
 
@@ -745,10 +875,20 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             self._append_console(f"Idioma: {language or 'detección automática'}")
             self._append_console(f"Dispositivo: {device}")
             self._append_console(f"FP16: {'Sí' if use_fp16 else 'No'}")
+            self._append_console(
+                "Pista: "
+                f"{audio_stream.get('codec_name', 'desconocido')} · "
+                f"{audio_stream.get('channels', '?')} canal(es) · "
+                f"{audio_stream.get('sample_rate', '?')} Hz"
+            )
             if initial_prompt:
                 self._append_console("Se usará el contexto indicado para nombres y vocabulario.")
 
             torch_module = load_torch()
+            self._append_console(
+                f"Versiones: Whisper {getattr(whisper_module, '__version__', 'desconocida')} · "
+                f"PyTorch {getattr(torch_module, '__version__', 'desconocida')}"
+            )
             if device == "cuda":
                 self._append_console(f"GPU: {torch_module.cuda.get_device_name(0)}")
 
@@ -759,22 +899,16 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             self._set_status("Transcribiendo audio")
             self._append_console(f"Transcribiendo {media_kind.lower()}...")
             with torch_module.inference_mode():
-                result = model.transcribe(
-                    str(media_file),
-                    language=language,
-                    fp16=use_fp16,
-                    initial_prompt=initial_prompt,
-                    word_timestamps=False,
-                    verbose=None,
+                result = transcribe_media(
+                    model,
+                    media_file,
+                    language,
+                    use_fp16,
+                    initial_prompt,
                 )
 
-            txt_file = media_file.with_suffix(".txt")
-            srt_file = media_file.with_suffix(".srt")
-
             self._set_status("Guardando resultados")
-            txt_content, srt_content = build_transcript_outputs(result)
-            write_windows_text(txt_file, txt_content)
-            write_windows_text(srt_file, srt_content)
+            txt_file, srt_file = save_transcript_outputs(media_file, result)
 
             self._append_console(f"TXT generado: {txt_file}")
             self._append_console(f"SRT generado: {srt_file}")
@@ -791,6 +925,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                 )
             )
         except Exception as exc:
+            diagnostic = traceback.format_exc()
             error_message = str(exc)
             if "out of memory" in error_message.lower():
                 error_message = (
@@ -799,6 +934,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                 if device == "cuda":
                     load_torch().cuda.empty_cache()
             self._append_console(f"Error: {error_message}")
+            self._append_console(f"Detalles técnicos:\n{diagnostic}")
             self._set_status("Error")
             self._ui(lambda msg=error_message: messagebox.showerror(APP_TITLE, msg, parent=self))
         finally:

@@ -1,7 +1,38 @@
-EJECUTAR DESDE LA RAIZ DEL REPO
+# Audio y Video a Texto
 
+## Preparación del entorno
+
+Ejecuta desde la carpeta `video2text` con Python 3.12:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 ```
-.\video2text\Scripts\python.exe .\video2text\video2text.py
+
+Instala PyTorch con la variante apropiada para la GPU y CUDA antes de instalar
+las demás dependencias. El entorno validado usa PyTorch `2.5.1+cu121` con una
+NVIDIA RTX 4070 SUPER. Después instala el resto:
+
+```powershell
+python -m pip install -r .\requirements.txt
+```
+
+Verifica el entorno con:
+
+```powershell
+python -m pip check
+python -c "import torch, whisper; print(torch.__version__, whisper.__version__)"
+```
+
+No versiones `.venv`, `Scripts`, `Lib`, `Include`, `share` ni `pyvenv.cfg`.
+
+## Ejecutar
+
+Desde la carpeta `video2text`:
+
+```powershell
+.\.venv\Scripts\python.exe .\video2text.py
 ```
 
 Al ejecutar este comando se abre una ventana. Mientras la ventana siga abierta,
@@ -17,23 +48,11 @@ Formatos admitidos:
 - Audio: AAC, AIF, AIFF, FLAC, M4A, MP3, OGA, OGG, OPUS, WAV y WMA.
 - Video: AVI, MKV, MOV, MP4 y WEBM.
 
-ALTERNATIVA (ENTRANDO A LA CARPETA `video2text`)
+Con el entorno activado, el comando equivalente es:
 
-```
-cd .\video2text
-.\Scripts\activate
+```powershell
 python .\video2text.py
 ```
-
-Para instalar o actualizar Whisper a la versión validada por el proyecto:
-
-```
-python -m pip install -r .\requirements.txt
-```
-
-PyTorch con CUDA se administra por separado porque el paquete correcto depende
-de la GPU y de la versión CUDA. No conviene reemplazarlo con una actualización
-genérica de `pip` sin comprobar primero la variante CUDA.
 
 ## Cerrar la aplicación
 
@@ -41,11 +60,19 @@ Usa el botón **X** de la ventana. También puedes presionar `Ctrl+C` en
 PowerShell; la aplicación ahora terminará limpiamente, sin mostrar un
 `KeyboardInterrupt`.
 
-Para abrirla sin mantener una consola visible, ejecuta desde la raíz:
+Para abrirla sin mantener una consola visible:
 
+```powershell
+.\.venv\Scripts\pythonw.exe .\video2text.py
 ```
-.\video2text\Scripts\pythonw.exe .\video2text\video2text.py
-```
+
+## Generar el ejecutable
+
+Ejecuta esta única línea desde la carpeta `video2text` después de cada actualización: `powershell -ExecutionPolicy Bypass -File .\build_exe.ps1`
+
+El resultado se genera en `dist\Video2Text.exe` con `totext.ico`, Whisper,
+`tkinterdnd2`, FFmpeg y FFprobe incluidos. El modelo Whisper se descarga y se
+almacena en la caché del usuario durante el primer uso si todavía no existe.
 
 Si cierras la ventana mientras se está transcribiendo un archivo, la aplicación
 pedirá confirmación porque el procesamiento en curso se cancelará.
@@ -55,7 +82,8 @@ pedirá confirmación porque el procesamiento en curso se cancelará.
 - **Modelo `turbo`**: recomendado para la RTX 4070 SUPER; es mucho más rápido
   que `large-v3` y conserva una precisión cercana.
 - **Idioma `es`**: evita el paso de detección y es ideal para contenido en español.
-  Usa `auto` cuando el idioma sea desconocido.
+  También admite nombres como `español`, `inglés` o `portugués`. Usa `auto`
+  cuando el idioma sea desconocido.
 - **Contexto**: escribe nombres propios, siglas o vocabulario técnico que
   esperas encontrar; Whisper lo utiliza como guía para la transcripción.
 - **Dispositivo `auto` y FP16 activo**: usa CUDA cuando está disponible y
@@ -70,3 +98,24 @@ siguientes ejecuciones con el mismo modelo y dispositivo comienzan más rápido.
 - `Ctrl+Enter`: iniciar la transcripción.
 - Haz clic en la zona **Arrastra el audio o video aquí** para abrir el selector.
 - **Limpiar registro** vacía la consola visual sin borrar archivos generados.
+
+## Validación y pruebas
+
+La aplicación usa `ffprobe` antes de cargar Whisper para rechazar archivos
+dañados o sin pista de audio. FFmpeg y FFprobe deben estar disponibles en
+`PATH`.
+
+Ejecuta las pruebas rápidas con:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+La prueba de integración crea un OGG temporal, carga el modelo instalado y
+ejecuta una inferencia real. Requiere que el modelo esté descargado o acceso
+para descargarlo:
+
+```powershell
+$env:VIDEO2TEXT_RUN_WHISPER_INTEGRATION = "1"
+python -m unittest discover -s tests -p "test_whisper_integration.py" -v
+```

@@ -35,8 +35,13 @@ venv/
 ENV/
 env/
 .venv/
-.video2text/Lib/
-.video2text/Include/
+
+# Entorno virtual heredado creado en la raíz del proyecto
+/Include/
+/Lib/
+/Scripts/
+/share/
+/pyvenv.cfg
 
 # pipenv
 Pipfile.lock
