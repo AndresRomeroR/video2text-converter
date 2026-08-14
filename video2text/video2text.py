@@ -28,9 +28,23 @@ _whisper = None
 _whisper_error: Optional[Exception] = None
 
 
-APP_TITLE = "Video a Texto - Whisper"
+APP_TITLE = "Audio y Video a Texto - Whisper"
 WINDOW_SIZE = (920, 700)
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".aac",
+    ".aif",
+    ".aiff",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".oga",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".wma",
+}
+SUPPORTED_MEDIA_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS | SUPPORTED_AUDIO_EXTENSIONS
 DEFAULT_MODEL = "turbo"
 DEFAULT_LANG = "es"
 MODEL_HINTS = {
@@ -120,18 +134,23 @@ def _parse_drop_file(master: tk.Tk, data: str) -> Optional[str]:
         return raw or None
 
 
-def resolve_video_file(video_file: Path) -> Path:
-    if not video_file.exists() or not video_file.is_file():
-        raise FileNotFoundError(f"No se encontró el archivo: {video_file}")
+def resolve_media_file(media_file: Path) -> Path:
+    if not media_file.exists() or not media_file.is_file():
+        raise FileNotFoundError(f"No se encontró el archivo: {media_file}")
 
-    suffix = video_file.suffix.lower()
-    if suffix not in SUPPORTED_VIDEO_EXTENSIONS:
-        supported = ", ".join(sorted(SUPPORTED_VIDEO_EXTENSIONS))
+    suffix = media_file.suffix.lower()
+    if suffix not in SUPPORTED_MEDIA_EXTENSIONS:
+        supported = ", ".join(sorted(SUPPORTED_MEDIA_EXTENSIONS))
         raise ValueError(
             f"Extensión no compatible: {suffix or '(sin extensión)'}.\n"
             f"Extensiones permitidas: {supported}"
         )
-    return video_file
+    return media_file
+
+
+def resolve_video_file(video_file: Path) -> Path:
+    """Compatibilidad con integraciones que usaban el nombre anterior."""
+    return resolve_media_file(video_file)
 
 
 def require_ffmpeg() -> str:
@@ -287,25 +306,27 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         header = ttk.Frame(root)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 16))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Video a Texto", style="Title.TLabel").grid(
+        ttk.Label(header, text="Audio y Video a Texto", style="Title.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         ttk.Label(
             header,
-            text="Transcripción local con Whisper · genera TXT y SRT junto al video",
+            text="Transcripción local con Whisper · genera TXT y SRT junto al archivo",
             style="Subtitle.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(3, 0))
         ttk.Label(header, text="Ctrl+O  Abrir   ·   Ctrl+Enter  Procesar", style="Hint.TLabel").grid(
             row=0, column=1, rowspan=2, sticky="e"
         )
 
-        file_box = ttk.LabelFrame(root, text="1  Selecciona el video", style="Section.TLabelframe")
+        file_box = ttk.LabelFrame(
+            root, text="1  Selecciona el audio o video", style="Section.TLabelframe"
+        )
         file_box.grid(row=1, column=0, sticky="ew")
         file_box.columnconfigure(0, weight=1)
 
         self.lbl_drop = ttk.Label(
             file_box,
-            text="Arrastra el video aquí\no haz clic para buscarlo",
+            text="Arrastra el audio o video aquí\no haz clic para buscarlo",
             anchor="center",
             relief="groove",
             justify="center",
@@ -324,7 +345,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
         self.lbl_file = ttk.Label(
             file_box,
-            text="Ningún archivo seleccionado · MP4, MKV, MOV, AVI o WEBM",
+            text="Ningún archivo seleccionado · audio: MP3, OGG, WAV, M4A, FLAC · video: MP4, MKV, MOV",
             style="File.TLabel",
             anchor="w",
             wraplength=820,
@@ -408,7 +429,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         actions.grid(row=3, column=0, sticky="ew", pady=14)
         actions.columnconfigure(2, weight=1)
 
-        self.btn_select = ttk.Button(actions, text="Cambiar video", command=self._on_select_file)
+        self.btn_select = ttk.Button(actions, text="Cambiar archivo", command=self._on_select_file)
         self.btn_select.grid(row=0, column=0, sticky="w")
 
         self.btn_open_folder = ttk.Button(
@@ -421,7 +442,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
         self.btn_process = ttk.Button(
             actions,
-            text="Transcribir video",
+            text="Transcribir archivo",
             command=self._on_process,
             state="disabled",
             style="Accent.TButton",
@@ -460,7 +481,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         if TkinterDnD is None:
             self._append_console(
                 "Arrastrar y soltar no está disponible porque tkinterdnd2 no está instalado. "
-                "Haz clic en la zona de selección para buscar el video."
+                "Haz clic en la zona de selección para buscar el archivo."
             )
 
     def _shortcut_select(self, _event=None) -> str:
@@ -585,8 +606,14 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
     def _on_select_file(self) -> None:
         path_str = filedialog.askopenfilename(
             parent=self,
-            title="Selecciona el video",
+            title="Selecciona el audio o video",
             filetypes=[
+                (
+                    "Audio y video compatibles",
+                    "*.aac *.aif *.aiff *.flac *.m4a *.mp3 *.oga *.ogg *.opus *.wav *.wma "
+                    "*.mp4 *.mkv *.mov *.avi *.webm",
+                ),
+                ("Audio", "*.aac *.aif *.aiff *.flac *.m4a *.mp3 *.oga *.ogg *.opus *.wav *.wma"),
                 ("Videos", "*.mp4 *.mkv *.mov *.avi *.webm"),
                 ("Todos los archivos", "*.*"),
             ],
@@ -597,7 +624,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
     def _set_selected_file(self, path: Path) -> None:
         try:
-            path = resolve_video_file(path)
+            path = resolve_media_file(path)
         except Exception as exc:
             messagebox.showwarning(APP_TITLE, str(exc), parent=self)
             return
@@ -623,13 +650,15 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         if self._running:
             return
         if self._selected_file is None:
-            messagebox.showwarning(APP_TITLE, "Selecciona primero un archivo de video.", parent=self)
+            messagebox.showwarning(
+                APP_TITLE, "Selecciona primero un archivo de audio o video.", parent=self
+            )
             return
 
         self._set_busy(True)
         self._set_status("Procesando")
         self._append_console("Iniciando transcripción...")
-        video_file = self._selected_file
+        media_file = self._selected_file
         model_size = self.var_model.get().strip() or DEFAULT_MODEL
         lang = self.var_lang.get().strip() or DEFAULT_LANG
         initial_prompt = self.var_prompt.get().strip() or None
@@ -637,7 +666,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         use_fp16 = bool(self.var_fp16.get())
         worker = threading.Thread(
             target=self._worker_process,
-            args=(video_file, model_size, lang, requested_device, use_fp16, initial_prompt),
+            args=(media_file, model_size, lang, requested_device, use_fp16, initial_prompt),
             daemon=True,
             name="whisper-transcription",
         )
@@ -688,7 +717,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
     def _worker_process(
         self,
-        video_file: Path,
+        media_file: Path,
         model_size: str,
         lang: str,
         requested_device: str,
@@ -702,14 +731,17 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             self._append_console("Cargando dependencias (torch/whisper)...")
             whisper_module = load_whisper()
 
-            video_file = resolve_video_file(video_file)
+            media_file = resolve_media_file(media_file)
             require_ffmpeg()
             language = normalize_language(whisper_module, lang)
             device, use_fp16 = self._resolve_device(requested_device, use_fp16)
 
-            self._append_console(f"Video: {video_file.name}")
+            media_kind = (
+                "Audio" if media_file.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS else "Video"
+            )
+            self._append_console(f"{media_kind}: {media_file.name}")
             self._append_console(f"Modelo: {model_size}")
-            self._append_console(f"Tamaño: {video_file.stat().st_size / (1024 ** 2):.1f} MB")
+            self._append_console(f"Tamaño: {media_file.stat().st_size / (1024 ** 2):.1f} MB")
             self._append_console(f"Idioma: {language or 'detección automática'}")
             self._append_console(f"Dispositivo: {device}")
             self._append_console(f"FP16: {'Sí' if use_fp16 else 'No'}")
@@ -725,10 +757,10 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             model = self._get_model(whisper_module, model_size, device)
 
             self._set_status("Transcribiendo audio")
-            self._append_console("Transcribiendo video...")
+            self._append_console(f"Transcribiendo {media_kind.lower()}...")
             with torch_module.inference_mode():
                 result = model.transcribe(
-                    str(video_file),
+                    str(media_file),
                     language=language,
                     fp16=use_fp16,
                     initial_prompt=initial_prompt,
@@ -736,8 +768,8 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                     verbose=None,
                 )
 
-            txt_file = video_file.with_suffix(".txt")
-            srt_file = video_file.with_suffix(".srt")
+            txt_file = media_file.with_suffix(".txt")
+            srt_file = media_file.with_suffix(".srt")
 
             self._set_status("Guardando resultados")
             txt_content, srt_content = build_transcript_outputs(result)

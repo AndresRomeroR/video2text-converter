@@ -10,6 +10,29 @@ import video2text
 
 
 class ProcessingTests(unittest.TestCase):
+    def test_resolve_media_file_accepts_audio_and_video(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for filename in ("grabacion.mp3", "voz.OGG", "audio.wav", "reunion.m4a", "video.mp4"):
+                media_file = root / filename
+                media_file.touch()
+                self.assertEqual(video2text.resolve_media_file(media_file), media_file)
+
+    def test_resolve_media_file_rejects_unsupported_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            media_file = Path(directory) / "notas.txt"
+            media_file.touch()
+
+            with self.assertRaisesRegex(ValueError, r"\.mp3"):
+                video2text.resolve_media_file(media_file)
+
+    def test_legacy_video_resolver_accepts_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audio_file = Path(directory) / "grabacion.flac"
+            audio_file.touch()
+
+            self.assertEqual(video2text.resolve_video_file(audio_file), audio_file)
+
     def test_srt_timestamp_clamps_negative_values(self):
         self.assertEqual(video2text.srt_timestamp(-1), "00:00:00,000")
         self.assertEqual(video2text.srt_timestamp(3661.234), "01:01:01,234")
