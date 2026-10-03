@@ -164,6 +164,25 @@ El informe debe indicar `"ok": true`; verifica Torch, Whisper, el tokenizador,
 los datos de audio, arrastrar y soltar, FFmpeg y FFprobe. Incluye `devices`,
 `torch_cuda` y `torch_rocm` para identificar lo disponible en ese entorno.
 Esta comprobación valida dependencias; no ejecuta inferencia en todas las GPU.
+También comprueba la barra de progreso de descarga, incluso sin consola.
+
+Para probar una descarga real desde cero y una inferencia corta dentro del EXE:
+
+```powershell
+Start-Process -FilePath .\dist\Video2Text.exe -ArgumentList '--check-model-download', 'descarga.json' -WindowStyle Hidden -Wait
+Get-Content .\descarga.json
+```
+
+Esta prueba requiere Internet, descarga `tiny` (aproximadamente 72 MiB) a una
+carpeta temporal y la elimina al terminar. No modifica los modelos de la caché
+del usuario. El informe debe indicar `ok`, `fresh_download` e `inference` en
+`true`. Desde el código fuente también admite
+`python video2text.py --check-model-download descarga.json`.
+
+El modo sin consola (`pythonw` o EXE con `--windowed`) proporciona salidas
+seguras a las dependencias cuando `stdout`/`stderr` no existen. Esto evita el
+error `'NoneType' object has no attribute 'write'` de `tqdm` durante la descarga.
+Los errores de transcripción siguen apareciendo en el registro de la interfaz.
 
 En código fuente (cualquier sistema):
 `python video2text.py --check-dependencies diagnostico.json`.

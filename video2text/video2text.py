@@ -9,11 +9,28 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import wave
 from pathlib import Path
 from typing import Callable, Optional
+
+
+def ensure_standard_streams() -> None:
+    """pythonw/PyInstaller windowed dejan stdout/stderr en None.
+
+    tqdm y otras dependencias necesitan objetos con write/flush incluso cuando
+    no hay consola. Conservamos los streams reales si se ejecuta en terminal.
+    """
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
+# Antes de importar dependencias que puedan capturar los streams al inicializarse.
+ensure_standard_streams()
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -1029,6 +1046,10 @@ def check_dependencies() -> dict:
     tokenizer = whisper_module.tokenizer.get_tokenizer(multilingual=True, language="es")
     assert tokenizer.decode(tokenizer.encode("Prueba de voz")) == "Prueba de voz"
     whisper_module.log_mel_spectrogram(torch_module.zeros(16000))
+    # La descarga usa tqdm aun cuando la transcripcion tiene verbose=None.
+    # Esta comprobacion debe funcionar tambien dentro del EXE sin consola.
+    with whisper_module.tqdm(total=1, disable=False) as progress:
+        progress.update(1)
     for name in ("ffmpeg", "ffprobe"):
         binary = find_media_binary(name)
         if not binary:
@@ -1047,10 +1068,37 @@ def check_dependencies() -> dict:
     }
 
 
+def check_model_download() -> dict:
+    """Prueba optativa de descarga sin cache e inferencia en el mismo ejecutable."""
+    report = check_dependencies()
+    torch_module = load_torch()
+    whisper_module = load_whisper()
+    with tempfile.TemporaryDirectory(prefix="video2text-check-") as directory:
+        model = whisper_module.load_model(
+            "tiny", device="cpu", download_root=str(Path(directory) / "models")
+        )
+        audio_file = Path(directory) / "silence.wav"
+        with wave.open(str(audio_file), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(b"\x00\x00" * 8000)
+        with torch_module.inference_mode():
+            result = transcribe_media(model, audio_file, "es", False, None)
+        if "text" not in result or "segments" not in result:
+            raise RuntimeError("La prueba de inferencia no devolvio una transcripcion.")
+    report.update(model="tiny", fresh_download=True, inference=True)
+    return report
+
+
 def main() -> None:
-    if len(sys.argv) == 3 and sys.argv[1] == "--check-dependencies":
+    checks = {
+        "--check-dependencies": check_dependencies,
+        "--check-model-download": check_model_download,
+    }
+    if len(sys.argv) == 3 and sys.argv[1] in checks:
         try:
-            report = check_dependencies()
+            report = checks[sys.argv[1]]()
         except Exception:
             report = {"ok": False, "error": traceback.format_exc()}
         Path(sys.argv[2]).write_text(json.dumps(report, indent=2), encoding="utf-8")
