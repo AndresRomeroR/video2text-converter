@@ -12,6 +12,18 @@ import video2text
 
 
 class ProcessingTests(unittest.TestCase):
+    def test_frozen_dependency_error_requests_rebuild(self):
+        with patch.object(video2text.sys, "frozen", True, create=True):
+            message = video2text.dependency_error("Whisper", "openai-whisper")
+        self.assertIn("build_exe.ps1", message)
+        self.assertNotIn("pip install", message)
+
+    def test_source_dependency_error_targets_current_python(self):
+        with patch.object(video2text.sys, "frozen", False, create=True):
+            message = video2text.dependency_error("Whisper", "openai-whisper")
+        self.assertIn(sys.executable, message)
+        self.assertIn("-m pip install --upgrade openai-whisper", message)
+
     def test_bundled_resource_uses_pyinstaller_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(video2text.sys, "_MEIPASS", directory, create=True):

@@ -5,6 +5,7 @@ import gc
 import json
 import os
 import queue
+import shlex
 import shutil
 import subprocess
 import sys
@@ -90,20 +91,103 @@ def find_media_binary(name: str) -> Optional[str]:
     return shutil.which(name)
 
 
+def dependency_error(component: str, package: str) -> str:
+    if getattr(sys, "frozen", False):
+        return (
+            f"No se pudo cargar {component} desde el ejecutable. "
+            "Vuelve a generar la aplicación con build_exe.py (build_exe.ps1 en Windows); "
+            "instalar paquetes con pip no modifica un ejecutable ya creado."
+        )
+    command = (
+        f'& "{sys.executable}"' if sys.platform == "win32" else shlex.quote(sys.executable)
+    )
+    return (
+        f"No se pudo cargar {component}. Reinstala en este entorno con: "
+        f'{command} -m pip install --upgrade {package}'
+    )
+
+
+def available_devices(torch_module) -> list[str]:
+    """Consulta los backends instalados; ROCm usa la API cuda de PyTorch."""
+    devices = []
+    backends = (
+        ("cuda", getattr(torch_module, "cuda", None)),
+        ("xpu", getattr(torch_module, "xpu", None)),
+        ("mps", getattr(getattr(torch_module, "backends", None), "mps", None)),
+    )
+    for name, backend in backends:
+        try:
+            if backend is not None and backend.is_available():
+                devices.append(name)
+        except Exception:
+            # Un controlador roto no debe impedir el uso de CPU.
+            continue
+    return devices + ["cpu"]
+
+
+def resolve_device(torch_module, requested: str, fp16: bool) -> tuple[str, bool]:
+    devices = available_devices(torch_module)
+    requested = "cuda" if requested == "rocm" else requested
+    device = devices[0] if requested == "auto" else requested
+    if device not in devices:
+        device = "cpu"
+    # FP32 en XPU/MPS evita asumir compatibilidad de las operaciones FP16 de Whisper.
+    return device, bool(fp16 and device == "cuda")
+
+
+def device_description(torch_module, device: str) -> str:
+    if device == "cuda":
+        kind = "AMD / ROCm" if getattr(torch_module.version, "hip", None) else "NVIDIA / CUDA"
+        return f"{kind}: {torch_module.cuda.get_device_name(0)}"
+    if device == "xpu":
+        return f"Intel / XPU: {torch_module.xpu.get_device_name(0)}"
+    return "Apple / MPS" if device == "mps" else "CPU"
+
+
+def clear_device_cache(torch_module, device: str) -> None:
+    backend = getattr(torch_module, device, None)
+    try:
+        if backend is not None and hasattr(backend, "empty_cache"):
+            backend.empty_cache()
+    except Exception:
+        pass  # La limpieza de una GPU averiada no debe bloquear el respaldo CPU.
+
+
+def run_with_cpu_fallback(action, device: str, fp16: bool, release, log):
+    """Reintenta una sola vez fuera del bloque except para liberar el traceback GPU."""
+    try:
+        return action(device, fp16), device
+    except (RuntimeError, NotImplementedError) as exc:
+        if device == "cpu":
+            raise
+        log(f"Falló la ejecución en {device}: {exc}")
+    release()
+    log("Reintentando en CPU con FP32. El modelo y el idioma se conservan.")
+    return action("cpu", False), "cpu"
+
+
+def open_folder(path: Path) -> None:
+    if sys.platform == "win32":
+        os.startfile(str(path))
+    else:
+        command = "open" if sys.platform == "darwin" else "xdg-open"
+        subprocess.Popen([command, str(path)])
+
+
 def load_torch():
     global _torch, _torch_error
     if _torch is not None:
         return _torch
     if _torch_error is not None:
         raise RuntimeError(
-            "No se pudo cargar torch. Reinstala con: pip install --upgrade torch"
+            dependency_error("torch", "torch")
         ) from _torch_error
     try:
         import torch as torch_module
     except Exception as exc:
         _torch_error = exc
         raise RuntimeError(
-            "No se pudo cargar torch. Reinstala con: pip install --upgrade torch"
+            dependency_error("torch", "torch")
         ) from exc
     _torch = torch_module
     return _torch
@@ -115,14 +199,14 @@ def load_whisper():
         return _whisper
     if _whisper_error is not None:
         raise RuntimeError(
-            "No se pudo cargar Whisper. Reinstala con: pip install -U openai-whisper"
+            dependency_error("Whisper", "openai-whisper")
         ) from _whisper_error
     try:
         import whisper as whisper_module
     except Exception as exc:
         _whisper_error = exc
         raise RuntimeError(
-            "No se pudo cargar Whisper. Reinstala con: pip install -U openai-whisper"
+            dependency_error("Whisper", "openai-whisper")
         ) from exc
     _whisper = whisper_module
     return _whisper
@@ -523,7 +607,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             options,
             textvariable=self.var_device,
             state="readonly",
-            values=("auto", "cuda", "cpu"),
+            values=("auto", "cuda", "rocm", "xpu", "mps", "cpu"),
         )
         self.cmb_device.grid(row=1, column=2, sticky="ew", padx=8, pady=(4, 0))
         ttk.Label(options, text="Auto usa CUDA si está disponible", style="Hint.TLabel").grid(
@@ -771,7 +855,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             return
         target = self._selected_file.parent
         try:
-            os.startfile(str(target))
+            open_folder(target)
         except Exception as exc:
             messagebox.showerror(APP_TITLE, str(exc), parent=self)
 
@@ -803,26 +887,17 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
     def _resolve_device(self, requested_device: str, use_fp16: bool) -> tuple[str, bool]:
         torch_module = load_torch()
-
-        cuda_available = bool(torch_module.cuda.is_available())
-
-        if requested_device == "auto":
-            device = "cuda" if cuda_available else "cpu"
-        elif requested_device == "cuda":
-            if not cuda_available:
-                self._append_console("CUDA no está disponible. Se usará CPU.")
-                device = "cpu"
-                use_fp16 = False
-            else:
-                device = "cuda"
-        else:
-            device = "cpu"
-            use_fp16 = False
-
-        if device != "cuda":
-            use_fp16 = False
-
+        device, use_fp16 = resolve_device(torch_module, requested_device, use_fp16)
+        if device == "cpu" and requested_device not in ("auto", "cpu"):
+            self._append_console(f"{requested_device} no está disponible. Se usará CPU.")
         return device, use_fp16
+
+    def _release_model(self) -> None:
+        device = self._loaded_model_key[1] if self._loaded_model_key else "cpu"
+        self._loaded_model = None
+        self._loaded_model_key = None
+        gc.collect()
+        clear_device_cache(load_torch(), device)
 
     def _get_model(self, whisper_module, model_size: str, device: str):
         model_key = (model_size, device)
@@ -832,12 +907,7 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
         if self._loaded_model is not None:
             self._append_console("Liberando el modelo anterior...")
-            self._loaded_model = None
-            self._loaded_model_key = None
-            gc.collect()
-            torch_module = load_torch()
-            if torch_module.cuda.is_available():
-                torch_module.cuda.empty_cache()
+            self._release_model()
 
         model = whisper_module.load_model(model_size, device=device)
         self._loaded_model = model
@@ -889,23 +959,26 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                 f"Versiones: Whisper {getattr(whisper_module, '__version__', 'desconocida')} · "
                 f"PyTorch {getattr(torch_module, '__version__', 'desconocida')}"
             )
-            if device == "cuda":
-                self._append_console(f"GPU: {torch_module.cuda.get_device_name(0)}")
+            self._append_console(f"Procesador: {device_description(torch_module, device)}")
 
-            self._set_status("Cargando modelo")
-            self._append_console("Cargando modelo Whisper...")
-            model = self._get_model(whisper_module, model_size, device)
+            def transcribe_on_device(target_device, fp16):
+                self._set_status("Cargando modelo")
+                self._append_console(f"Cargando modelo Whisper en {target_device}...")
+                model = self._get_model(whisper_module, model_size, target_device)
+                self._set_status("Transcribiendo audio")
+                self._append_console(f"Transcribiendo {media_kind.lower()} en {target_device}...")
+                with torch_module.inference_mode():
+                    return transcribe_media(model, media_file, language, fp16, initial_prompt)
 
-            self._set_status("Transcribiendo audio")
-            self._append_console(f"Transcribiendo {media_kind.lower()}...")
-            with torch_module.inference_mode():
-                result = transcribe_media(
-                    model,
-                    media_file,
-                    language,
-                    use_fp16,
-                    initial_prompt,
-                )
+            def release_failed_model():
+                self._release_model()
+                clear_device_cache(torch_module, device)
+
+            result, device = run_with_cpu_fallback(
+                transcribe_on_device, device, use_fp16,
+                release_failed_model, self._append_console,
+            )
+            self._append_console(f"Dispositivo utilizado: {device}")
 
             self._set_status("Guardando resultados")
             txt_file, srt_file = save_transcript_outputs(media_file, result)
@@ -929,10 +1002,9 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             error_message = str(exc)
             if "out of memory" in error_message.lower():
                 error_message = (
-                    "La GPU se quedó sin memoria. Prueba el modelo 'turbo' o uno más pequeño."
+                    "No hay memoria suficiente. Prueba un modelo más pequeño, como 'base'."
                 )
-                if device == "cuda":
-                    load_torch().cuda.empty_cache()
+                clear_device_cache(load_torch(), device)
             self._append_console(f"Error: {error_message}")
             self._append_console(f"Detalles técnicos:\n{diagnostic}")
             self._set_status("Error")
@@ -941,7 +1013,48 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             self._ui(lambda: self._set_busy(False))
 
 
+def check_dependencies() -> dict:
+    """Comprueba también los recursos nativos y datos del ejecutable empaquetado."""
+    torch_module = load_torch()
+    whisper_module = load_whisper()
+    if TkinterDnD is None:
+        raise RuntimeError(dependency_error("TkDnD", "tkinterdnd2"))
+    root = TkinterDnD.Tk()
+    root.withdraw()
+    try:
+        root.drop_target_register(DND_FILES)
+        tkdnd_version = root.tk.call("package", "require", "tkdnd")
+    finally:
+        root.destroy()
+    tokenizer = whisper_module.tokenizer.get_tokenizer(multilingual=True, language="es")
+    assert tokenizer.decode(tokenizer.encode("Prueba de voz")) == "Prueba de voz"
+    whisper_module.log_mel_spectrogram(torch_module.zeros(16000))
+    for name in ("ffmpeg", "ffprobe"):
+        binary = find_media_binary(name)
+        if not binary:
+            raise RuntimeError(f"No se encontro {name}")
+        subprocess.run([binary, "-version"], check=True, capture_output=True, timeout=30)
+    return {
+        "ok": True,
+        "python": sys.version.split()[0],
+        "torch": torch_module.__version__,
+        "whisper": whisper_module.__version__,
+        "tkdnd": tkdnd_version,
+        "cuda": torch_module.cuda.is_available(),
+        "devices": available_devices(torch_module),
+        "torch_cuda": getattr(torch_module.version, "cuda", None),
+        "torch_rocm": getattr(torch_module.version, "hip", None),
+    }
+
+
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-dependencies":
+        try:
+            report = check_dependencies()
+        except Exception:
+            report = {"ok": False, "error": traceback.format_exc()}
+        Path(sys.argv[2]).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        raise SystemExit(0 if report["ok"] else 1)
     _windows_set_dpi_awareness()
     app = Video2TextApp()
     try:

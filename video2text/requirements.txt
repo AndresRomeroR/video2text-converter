@@ -1,4 +1,5 @@
-# Versión de Whisper validada con Python 3.12 y PyTorch 2.5.1+cu121.
-# PyTorch se instala por separado para conservar la variante CUDA correcta.
+# Whisper estable más reciente; PyTorch se resuelve según el Python instalado.
+# Para GPU, instala primero PyTorch CUDA (NVIDIA), ROCm (AMD) o XPU (Intel).
+# No fijar una variante CPU/CUDA aqui: el mismo codigo funciona con todas.
 openai-whisper==20250625
-tkinterdnd2==0.6.2
+tkinterdnd2==0.6.3

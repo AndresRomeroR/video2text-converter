@@ -43,7 +43,13 @@ class WhisperIntegrationTests(unittest.TestCase):
             )
 
             video2text.probe_audio_stream(audio_file)
-            device = "cuda" if torch_module.cuda.is_available() else "cpu"
+            requested_device = os.environ.get("VIDEO2TEXT_TEST_DEVICE", "auto")
+            device, fp16 = video2text.resolve_device(torch_module, requested_device, True)
+            if requested_device != "auto":
+                expected = "cuda" if requested_device == "rocm" else requested_device
+                self.assertEqual(device, expected, "El backend solicitado no esta disponible.")
+                if requested_device == "rocm":
+                    self.assertTrue(torch_module.version.hip, "Esta instalacion no usa ROCm.")
             model_name = os.environ.get("VIDEO2TEXT_TEST_MODEL", "turbo")
             model = whisper_module.load_model(model_name, device=device)
             with torch_module.inference_mode():
@@ -51,7 +57,7 @@ class WhisperIntegrationTests(unittest.TestCase):
                     model,
                     audio_file,
                     "es",
-                    device == "cuda",
+                    fp16,
                     None,
                 )
 
