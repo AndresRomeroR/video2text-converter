@@ -35,6 +35,7 @@ venv/
 ENV/
 env/
 .venv/
+.venv-*/
 
 # Entorno virtual heredado creado en la raíz del proyecto
 /Include/

@@ -161,6 +161,19 @@ def device_description(torch_module, device: str) -> str:
     return "Apple / MPS" if device == "mps" else "CPU"
 
 
+def torch_build_description(torch_module) -> str:
+    """Distingue las capacidades incluidas de la GPU disponible en este equipo."""
+    if getattr(torch_module.version, "hip", None):
+        return f"ROCm {torch_module.version.hip} + CPU"
+    if getattr(torch_module.version, "cuda", None):
+        return f"CUDA {torch_module.version.cuda} + CPU"
+    if getattr(getattr(torch_module, "xpu", None), "_is_compiled", lambda: False)():
+        return "Intel XPU + CPU"
+    if getattr(getattr(torch_module.backends, "mps", None), "is_built", lambda: False)():
+        return "Apple MPS + CPU"
+    return "CPU"
+
+
 def clear_device_cache(torch_module, device: str) -> None:
     backend = getattr(torch_module, device, None)
     try:
@@ -481,6 +494,9 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.bind("<Control-o>", self._shortcut_select)
         self.bind("<Control-Return>", self._shortcut_process)
         self.after(50, self._drain_ui_queue)
+        self.after(150, lambda: threading.Thread(
+            target=self._detect_acceleration, daemon=True
+        ).start())
 
     def _apply_window_icon(self) -> None:
         icon_path = bundled_resource("totext.ico")
@@ -542,6 +558,11 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
             text="Transcripción local con Whisper · genera TXT y SRT junto al archivo",
             style="Subtitle.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        self.lbl_acceleration = ttk.Label(
+            header, text="Comprobando aceleración disponible…", style="Hint.TLabel",
+            wraplength=820,
+        )
+        self.lbl_acceleration.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Label(header, text="Ctrl+O  Abrir   ·   Ctrl+Enter  Procesar", style="Hint.TLabel").grid(
             row=0, column=1, rowspan=2, sticky="e"
         )
@@ -713,6 +734,18 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                 "Arrastrar y soltar no está disponible porque tkinterdnd2 no está instalado. "
                 "Haz clic en la zona de selección para buscar el archivo."
             )
+
+    def _detect_acceleration(self) -> None:
+        try:
+            torch_module = load_torch()
+            included = torch_build_description(torch_module)
+            device, _ = resolve_device(torch_module, "auto", True)
+            available = device_description(torch_module, device)
+            text = f"Versión incluida: {included} · Automático en este equipo: {available}"
+        except Exception as exc:
+            text = f"No se pudo comprobar la aceleración: {exc}"
+        self._ui(lambda: self.lbl_acceleration.config(text=text))
+        self._append_console(text)
 
     def _shortcut_select(self, _event=None) -> str:
         if not self._running:
@@ -1059,6 +1092,7 @@ def check_dependencies() -> dict:
         "ok": True,
         "python": sys.version.split()[0],
         "torch": torch_module.__version__,
+        "torch_build": torch_build_description(torch_module),
         "whisper": whisper_module.__version__,
         "tkdnd": tkdnd_version,
         "cuda": torch_module.cuda.is_available(),

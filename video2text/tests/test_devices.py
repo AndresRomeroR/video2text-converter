@@ -18,6 +18,16 @@ def fake_torch(cuda=False, xpu=False, mps=False, hip=None):
 
 
 class DeviceTests(unittest.TestCase):
+    def test_cuda_build_is_identified_even_without_nvidia_driver(self):
+        torch = fake_torch(cuda=False)
+        torch.version.cuda = "12.8"
+        self.assertEqual(video2text.torch_build_description(torch), "CUDA 12.8 + CPU")
+        self.assertEqual(video2text.resolve_device(torch, "auto", True), ("cpu", False))
+
+    def test_cpu_and_rocm_builds_are_distinguished(self):
+        self.assertEqual(video2text.torch_build_description(fake_torch()), "CPU")
+        self.assertEqual(video2text.torch_build_description(fake_torch(hip="7")), "ROCm 7 + CPU")
+
     def test_auto_on_each_backend_and_cpu(self):
         for kwargs, expected in (
             ({}, ("cpu", False)),

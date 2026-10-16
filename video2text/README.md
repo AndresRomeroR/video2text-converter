@@ -48,6 +48,8 @@ python -c "import torch, whisper; print(torch.__version__, whisper.__version__)"
 
 Entorno comprobado en Windows: Python `3.14.7`, PyTorch `2.14.1+cpu`,
 Whisper `20250625` y `tkinterdnd2 0.6.3`, con inferencia real del modelo `tiny`.
+También se comprobó PyTorch `2.11.0+cu128` con inferencia real de `tiny` en CPU,
+en un equipo sin NVIDIA. Esta distribución incluye CUDA `12.8` y CPU.
 Las rutas de selección GPU y respaldo se prueban mediante simulaciones;
 la aceleración debe validarse en cada equipo con su hardware real.
 
@@ -120,11 +122,23 @@ estén implementadas en MPS/XPU; detectar la GPU no garantiza que todas las
 operaciones sean compatibles. FP16 se habilita únicamente en CUDA/ROCm.
 
 El código es compartido; los ejecutables y entornos son específicos de su
-sistema, arquitectura y distribución de PyTorch. El EXE CPU generado en este
-equipo seguirá usando CPU al copiarlo a otro Windows compatible, aunque ese
-equipo tenga GPU. Para aprovecharla, instala el PyTorch apropiado en un entorno
-nuevo y ejecuta el código o vuelve a compilar. Un `.exe` de Windows no se
-ejecuta de forma nativa en Linux/macOS.
+sistema, arquitectura y distribución de PyTorch. Un EXE con PyTorch CUDA sirve
+para **NVIDIA y CPU en un solo archivo**: `auto` usa la GPU compatible cuando
+está disponible y CPU cuando no lo está. También se puede elegir `cpu` manualmente.
+El EXE que solo incluye PyTorch CPU seguirá usando CPU aunque el receptor tenga
+una NVIDIA. Instalar CUDA o paquetes Python en el receptor no modifica ese EXE.
+Un `.exe` de Windows no se ejecuta de forma nativa en Linux/macOS.
+
+La cabecera y el registro muestran **Versión incluida** (por ejemplo,
+`CUDA 12.8 + CPU` o `CPU`) y **Automático en este equipo** (la GPU detectada o CPU).
+Esto permite distinguir un ejecutable con CUDA de uno CPU incluso al abrirlo
+en un equipo sin NVIDIA. El registro de cada transcripción indica el dispositivo
+final utilizado, también si fue necesario reintentar en CPU.
+
+En el equipo receptor solo necesitas abrir el EXE, un controlador NVIDIA
+compatible para usar GPU e Internet para la primera descarga de cada modelo.
+Python, FFmpeg, FFprobe y las bibliotecas CUDA van dentro del EXE cuando se
+compila de esta forma; no hace falta instalar CUDA Toolkit por separado.
 
 ## Generar el ejecutable
 
@@ -142,6 +156,23 @@ y `dist/Video2Text.app` en macOS. Incluyen Whisper, `tkinterdnd2`, FFmpeg,
 FFprobe y la distribución de PyTorch instalada en ese entorno. El script
 conserva esa distribución; no cambia automáticamente de CPU a CUDA, ROCm o XPU.
 Los modelos se descargan a la caché del usuario en el primer uso.
+
+Para generar en Windows un único EXE NVIDIA/CPU sin modificar el entorno CPU
+existente, crea un entorno de compilación separado (con un Python admitido por
+la distribución seleccionada). Por ejemplo, con PyTorch CUDA 12.8:
+
+```powershell
+py -m venv .venv-cuda
+.\.venv-cuda\Scripts\python.exe -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+.\.venv-cuda\Scripts\python.exe build_exe.py --require-cuda
+```
+
+`--require-cuda` verifica las bibliotecas incluidas tanto en el entorno como en
+el EXE; no exige tener una NVIDIA en el equipo que compila. El resultado es
+`dist/Video2Text.exe`. Para producir otro archivo sin reemplazarlo, usa
+`--name Video2Text-CUDA-CPU`. Con un entorno CPU puedes usar
+`--name Video2Text-CPU` para generar una alternativa más pequeña.
+Cada compilación guarda sus informes en `build/<nombre>/`.
 
 Compila y prueba por separado en cada sistema y arquitectura de destino,
 como indica [PyInstaller](https://pyinstaller.org/en/stable/operating-mode.html).
@@ -163,6 +194,9 @@ Get-Content .\diagnostico.json
 El informe debe indicar `"ok": true`; verifica Torch, Whisper, el tokenizador,
 los datos de audio, arrastrar y soltar, FFmpeg y FFprobe. Incluye `devices`,
 `torch_cuda` y `torch_rocm` para identificar lo disponible en ese entorno.
+`torch_build` describe la variante incluida. `torch_cuda: "12.8"` significa que
+incluye CUDA aunque `cuda` sea `false` en un equipo sin NVIDIA; `torch_cuda: null`
+significa que no incluye CUDA NVIDIA (consulta también `torch_rocm` para AMD).
 Esta comprobación valida dependencias; no ejecuta inferencia en todas las GPU.
 También comprueba la barra de progreso de descarga, incluso sin consola.
 
