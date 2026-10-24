@@ -34,7 +34,11 @@ ensure_standard_streams()
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 from tkinter.scrolledtext import ScrolledText
+
+from transcription_queue import BatchQueue, QueueItem
+from output_paths import plan_output_paths
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -50,7 +54,7 @@ _whisper_error: Optional[Exception] = None
 
 
 APP_TITLE = "Audio y Video a Texto - Whisper"
-WINDOW_SIZE = (920, 700)
+WINDOW_SIZE = (1000, 740)
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm"}
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".aac",
@@ -254,31 +258,19 @@ def _windows_set_dpi_awareness() -> None:
             pass
 
 
-def _normalize_tk_scaling_to_96dpi(root: tk.Tk) -> None:
+def _parse_drop_files(master: tk.Tk, data: str) -> list[str]:
+    if not data:
+        return []
     try:
-        dpi = float(root.winfo_fpixels("1i"))
-        if dpi > 0:
-            root.tk.call("tk", "scaling", 96.0 / 72.0)
-    except Exception:
-        try:
-            root.tk.call("tk", "scaling", 1.0)
-        except Exception:
-            pass
+        return [str(item) for item in master.tk.splitlist(data)]
+    except tk.TclError:
+        return []
 
 
 def _parse_drop_file(master: tk.Tk, data: str) -> Optional[str]:
-    if not data:
-        return None
-    try:
-        items = master.tk.splitlist(data)
-        if not items:
-            return None
-        return str(items[0])
-    except Exception:
-        raw = str(data).strip()
-        if raw.startswith("{") and raw.endswith("}"):
-            raw = raw[1:-1].strip()
-        return raw or None
+    """Compatibilidad con integraciones que esperan un único archivo."""
+    items = _parse_drop_files(master, data)
+    return items[0] if items else None
 
 
 def resolve_media_file(media_file: Path) -> Path:
@@ -455,10 +447,14 @@ def transcribe_media(
     )
 
 
-def save_transcript_outputs(media_file: Path, result: dict) -> tuple[Path, Path]:
+def save_transcript_outputs(
+    media_file: Path, result: dict, *, include_extension: bool = False,
+    output_paths: Optional[tuple[Path, Path]] = None,
+) -> tuple[Path, Path]:
     """Guarda las salidas de una transcripción junto al archivo original."""
-    txt_file = media_file.with_suffix(".txt")
-    srt_file = media_file.with_suffix(".srt")
+    output_base = media_file.name if include_extension else media_file.stem
+    txt_file, srt_file = output_paths or (
+        media_file.with_name(f"{output_base}.txt"), media_file.with_name(f"{output_base}.srt"))
     txt_content, srt_content = build_transcript_outputs(result)
     write_windows_text(txt_file, txt_content)
     write_windows_text(srt_file, srt_content)
@@ -468,13 +464,18 @@ def save_transcript_outputs(media_file: Path, result: dict) -> tuple[Path, Path]
 class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        _normalize_tk_scaling_to_96dpi(self)
+        # Tk obtiene los DPI del sistema. Las fuentes están en puntos; solo las
+        # distancias expresadas en píxeles se multiplican por este factor.
+        self._scale = float(self.tk.call("tk", "scaling")) * 72.0 / 96.0
 
         self.title(APP_TITLE)
         self._apply_window_icon()
         self._apply_theme()
 
-        self._selected_file: Optional[Path] = None
+        self._batch = BatchQueue()
+        self._output_plan: dict[str, tuple[Path, Path]] = {}
+        self._stop_requested = threading.Event()
+        self._active_item_id: Optional[str] = None
         self._running = False
         self._closing = False
         self._main_thread_id = threading.get_ident()
@@ -489,6 +490,9 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         self.var_prompt = tk.StringVar()
 
         self._build_ui()
+        self._refresh_summary()
+        self._compact = False
+        self.bind("<Configure>", self._on_window_resize, add="+")
         self._center_window()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Control-o>", self._shortcut_select)
@@ -507,233 +511,243 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         except tk.TclError:
             pass
 
+    def _px(self, value: int) -> int:
+        return max(1, round(value * self._scale))
+
     def _apply_theme(self) -> None:
         style = ttk.Style(self)
         for theme in ("vista", "winnative", "xpnative", style.theme_use()):
             try:
                 style.theme_use(theme)
                 break
-            except Exception:
+            except tk.TclError:
                 continue
-
-        style.configure("Title.TLabel", font=("Segoe UI", 20, "bold"))
-        style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground="#5f6368")
-        style.configure("Section.TLabelframe", padding=14)
-        style.configure("Section.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
-        style.configure("Field.TLabel", font=("Segoe UI", 9, "bold"))
-        style.configure("Hint.TLabel", font=("Segoe UI", 9), foreground="#5f6368")
-        style.configure("File.TLabel", font=("Segoe UI", 9), foreground="#394457")
-        style.configure("Drop.TLabel", font=("Segoe UI", 11, "bold"), padding=(18, 22))
-        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"), padding=(18, 8))
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            tkfont.nametofont(name).configure(family="Segoe UI", size=10)
+        style.configure("TButton", padding=(self._px(10), self._px(6)))
+        style.configure("TNotebook.Tab", padding=(self._px(16), self._px(7)))
+        style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"))
+        style.configure("Hint.TLabel", foreground="#5f6368")
+        style.configure("Field.TLabel", font=("Segoe UI", 10, "bold"))
+        style.configure("Drop.TLabel", font=("Segoe UI", 11, "bold"),
+                        padding=(self._px(12), self._px(14)), background="#eaf2fb",
+                        foreground="#234e78")
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
         style.configure("Status.TLabel", font=("Segoe UI", 10, "bold"), foreground="#305f8f")
         style.configure("Success.Status.TLabel", foreground="#19733b")
         style.configure("Error.Status.TLabel", foreground="#b42318")
+        line_height = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        style.configure("Treeview", rowheight=line_height + self._px(10))
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
 
     def _center_window(self) -> None:
         self.update_idletasks()
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        width = min(WINDOW_SIZE[0], max(760, sw - 80))
-        height = min(WINDOW_SIZE[1], max(620, sh - 100))
-        self.minsize(760, 620)
+        left, top = 0, 0
+        right, bottom = self.winfo_screenwidth(), self.winfo_screenheight()
+        if sys.platform == "win32":
+            try:
+                from ctypes import wintypes
+                area = wintypes.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(area), 0):
+                    left, top, right, bottom = area.left, area.top, area.right, area.bottom
+            except (AttributeError, OSError):
+                pass
+        available_w = max(1, right - left - self._px(24))
+        available_h = max(1, bottom - top - self._px(48))
+        width = min(self._px(WINDOW_SIZE[0]), available_w)
+        height = min(self._px(WINDOW_SIZE[1]), available_h)
+        self.minsize(min(self._px(650), available_w), min(self._px(480), available_h))
         self.resizable(True, True)
-        pos_x = (sw // 2) - (width // 2)
-        pos_y = (sh // 2) - (height // 2)
-        self.geometry(f"{width}x{height}+{max(0, pos_x)}+{max(0, pos_y)}")
+        self.geometry(f"{width}x{height}+{left + (right-left-width)//2}+{top + (bottom-top-height)//2}")
 
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=20)
+        pad = self._px(14)
+        root = ttk.Frame(self, padding=pad)
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(4, weight=1)
+        root.rowconfigure(1, weight=1)
 
         header = ttk.Frame(root)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, self._px(12)))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Audio y Video a Texto", style="Title.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Label(
-            header,
-            text="Transcripción local con Whisper · genera TXT y SRT junto al archivo",
-            style="Subtitle.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
-        self.lbl_acceleration = ttk.Label(
-            header, text="Comprobando aceleración disponible…", style="Hint.TLabel",
-            wraplength=820,
-        )
-        self.lbl_acceleration.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        ttk.Label(header, text="Ctrl+O  Abrir   ·   Ctrl+Enter  Procesar", style="Hint.TLabel").grid(
-            row=0, column=1, rowspan=2, sticky="e"
-        )
+            row=0, column=0, sticky="w")
+        self.lbl_acceleration = ttk.Label(header, text="Comprobando aceleración…", style="Hint.TLabel")
+        self.lbl_acceleration.grid(row=1, column=0, sticky="ew", pady=(self._px(4), 0))
+        header.bind("<Configure>", lambda e: self.lbl_acceleration.config(wraplength=max(1, e.width)))
 
-        file_box = ttk.LabelFrame(
-            root, text="1  Selecciona el audio o video", style="Section.TLabelframe"
-        )
-        file_box.grid(row=1, column=0, sticky="ew")
-        file_box.columnconfigure(0, weight=1)
+        self.tabs = ttk.Notebook(root)
+        self.tabs.grid(row=1, column=0, sticky="nsew")
+        files = ttk.Frame(self.tabs, padding=pad)
+        settings = ttk.Frame(self.tabs, padding=pad)
+        logs = ttk.Frame(self.tabs, padding=pad)
+        self.tabs.add(files, text="Archivos")
+        self.tabs.add(settings, text="Configuración")
+        self.tabs.add(logs, text="Registro")
+        files.columnconfigure(0, weight=1)
+        files.rowconfigure(2, weight=1)
 
         self.lbl_drop = ttk.Label(
-            file_box,
-            text="Arrastra el audio o video aquí\no haz clic para buscarlo",
-            anchor="center",
-            relief="groove",
-            justify="center",
-            cursor="hand2",
-            style="Drop.TLabel",
-        )
+            files, text="Arrastra aquí uno o varios audios y videos\no haz clic para añadirlos",
+            anchor="center", justify="center", cursor="hand2", style="Drop.TLabel")
         self.lbl_drop.grid(row=0, column=0, sticky="ew")
         self.lbl_drop.bind("<Button-1>", self._on_drop_click)
+        files.bind("<Configure>", lambda e: self.lbl_drop.config(wraplength=max(1, e.width - 2*pad)))
 
+        toolbar = ttk.Frame(files)
+        toolbar.grid(row=1, column=0, sticky="ew", pady=self._px(10))
+        self.btn_select = ttk.Button(toolbar, text="Añadir archivos…", command=self._on_select_file)
+        self.btn_select.pack(side="left")
+        self.btn_remove = ttk.Button(toolbar, text="Quitar selección", command=self._on_remove)
+        self.btn_remove.pack(side="left", padx=self._px(6))
+        self.btn_clear_finished = ttk.Button(toolbar, text="Limpiar finalizados", command=self._on_clear_finished)
+        self.btn_clear_finished.pack(side="left")
+
+        table = ttk.Frame(files)
+        table.grid(row=2, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        self.file_tree = ttk.Treeview(table, columns=("name", "status", "size", "time", "folder"),
+                                     show="headings", selectmode="extended", height=7)
+        for key, title, width in (("name", "Archivo", 280), ("status", "Estado", 130),
+                                  ("size", "Tamaño", 90), ("time", "Tiempo", 85), ("folder", "Carpeta", 260)):
+            self.file_tree.heading(key, text=title)
+            self.file_tree.column(key, width=self._px(width), minwidth=self._px(70),
+                                  stretch=key in ("name", "folder"), anchor="w")
+        self.file_tree.grid(row=0, column=0, sticky="nsew")
+        yscroll = ttk.Scrollbar(table, orient="vertical", command=self.file_tree.yview)
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll = ttk.Scrollbar(table, orient="horizontal", command=self.file_tree.xview)
+        xscroll.grid(row=1, column=0, sticky="ew")
+        self.file_tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.file_tree.tag_configure("processing", foreground="#185b9d")
+        self.file_tree.tag_configure("completed", foreground="#19733b")
+        self.file_tree.tag_configure("error", foreground="#b42318")
+        self.file_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.file_tree.bind("<Delete>", lambda _e: self._on_remove())
+        self.file_tree.bind("<Double-1>", lambda _e: self._on_open_folder())
         if TkinterDnD is not None:
-            try:
-                self.lbl_drop.drop_target_register(DND_FILES)
-                self.lbl_drop.dnd_bind("<<Drop>>", self._on_drop_file)
-            except Exception:
-                pass
+            for target in (self.lbl_drop, self.file_tree):
+                try:
+                    target.drop_target_register(DND_FILES)
+                    target.dnd_bind("<<Drop>>", self._on_drop_file)
+                except tk.TclError:
+                    pass
 
-        self.lbl_file = ttk.Label(
-            file_box,
-            text="Ningún archivo seleccionado · audio: MP3, OGG, WAV, M4A, FLAC · video: MP4, MKV, MOV",
-            style="File.TLabel",
-            anchor="w",
-            wraplength=820,
-        )
-        self.lbl_file.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.txt_detail = ScrolledText(files, height=3, wrap="word", state="disabled",
+                                      font="TkDefaultFont", relief="flat", padx=self._px(6), pady=self._px(4))
+        self.txt_detail.grid(row=3, column=0, sticky="ew", pady=(self._px(8), 0))
+        self._set_file_detail("Añade archivos para comenzar. Se procesan en el orden del listado.")
+        self.btn_open_folder = ttk.Button(files, text="Abrir carpeta del seleccionado", command=self._on_open_folder)
+        self.btn_open_folder.grid(row=4, column=0, sticky="w", pady=(self._px(6), 0))
 
-        options = ttk.LabelFrame(
-            root, text="2  Configura la transcripción", style="Section.TLabelframe"
-        )
-        options.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+        self._build_settings(settings)
+        logs.columnconfigure(0, weight=1)
+        logs.rowconfigure(1, weight=1)
+        ttk.Button(logs, text="Limpiar registro", command=self._clear_console).grid(row=0, column=0, sticky="e")
+        self.txt_console = ScrolledText(logs, height=8, wrap="word", state="disabled",
+                                       font=("Consolas", 10), background="#111827", foreground="#dbe5f1",
+                                       relief="flat", padx=self._px(10), pady=self._px(8))
+        self.txt_console.grid(row=1, column=0, sticky="nsew", pady=(self._px(8), 0))
 
-        options.columnconfigure(0, weight=1)
-        options.columnconfigure(1, weight=1)
-        options.columnconfigure(2, weight=1)
-        options.columnconfigure(3, weight=1)
-
-        ttk.Label(options, text="Modelo", style="Field.TLabel").grid(
-            row=0, column=0, sticky="w", padx=(0, 8)
-        )
-        self.cmb_model = ttk.Combobox(
-            options,
-            textvariable=self.var_model,
-            state="readonly",
-            values=("turbo", "large-v3", "medium", "small", "base", "tiny"),
-        )
-        self.cmb_model.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(4, 0))
-        self.lbl_model_hint = ttk.Label(
-            options, text=MODEL_HINTS[DEFAULT_MODEL], style="Hint.TLabel"
-        )
-        self.lbl_model_hint.grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(3, 10))
-        self.cmb_model.bind("<<ComboboxSelected>>", self._update_model_hint)
-
-        ttk.Label(options, text="Idioma", style="Field.TLabel").grid(
-            row=0, column=1, sticky="w", padx=8
-        )
-        self.ent_lang = ttk.Entry(options, textvariable=self.var_lang)
-        self.ent_lang.grid(row=1, column=1, sticky="ew", padx=8, pady=(4, 0))
-        ttk.Label(
-            options,
-            text="Código o nombre: es, español, en o auto",
-            style="Hint.TLabel",
-        ).grid(row=2, column=1, sticky="w", padx=8, pady=(3, 10))
-
-        ttk.Label(options, text="Dispositivo", style="Field.TLabel").grid(
-            row=0, column=2, sticky="w", padx=8
-        )
-        self.cmb_device = ttk.Combobox(
-            options,
-            textvariable=self.var_device,
-            state="readonly",
-            values=("auto", "cuda", "rocm", "xpu", "mps", "cpu"),
-        )
-        self.cmb_device.grid(row=1, column=2, sticky="ew", padx=8, pady=(4, 0))
-        ttk.Label(options, text="Auto usa CUDA si está disponible", style="Hint.TLabel").grid(
-            row=2, column=2, sticky="w", padx=8, pady=(3, 10)
-        )
-
-        self.chk_fp16 = ttk.Checkbutton(
-            options,
-            text="Aceleración FP16",
-            variable=self.var_fp16,
-        )
-        self.chk_fp16.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=(4, 0))
-        ttk.Label(options, text="Menos memoria y mayor velocidad", style="Hint.TLabel").grid(
-            row=2, column=3, sticky="w", padx=(8, 0), pady=(3, 10)
-        )
-
-        ttk.Label(options, text="Contexto opcional", style="Field.TLabel").grid(
-            row=3, column=0, columnspan=4, sticky="w"
-        )
-        self.ent_prompt = ttk.Entry(
-            options,
-            textvariable=self.var_prompt,
-        )
-        self.ent_prompt.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(4, 0))
-        ttk.Label(
-            options,
-            text="Ejemplo: Azure OpenAI, FastAPI, nombres propios o vocabulario técnico",
-            style="Hint.TLabel",
-        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(3, 0))
-
-        actions = ttk.Frame(root)
-        actions.grid(row=3, column=0, sticky="ew", pady=14)
-        actions.columnconfigure(2, weight=1)
-
-        self.btn_select = ttk.Button(actions, text="Cambiar archivo", command=self._on_select_file)
-        self.btn_select.grid(row=0, column=0, sticky="w")
-
-        self.btn_open_folder = ttk.Button(
-            actions,
-            text="Abrir carpeta del archivo",
-            command=self._on_open_folder,
-            state="disabled",
-        )
-        self.btn_open_folder.grid(row=0, column=1, sticky="w", padx=(8, 0))
-
-        self.btn_process = ttk.Button(
-            actions,
-            text="Transcribir archivo",
-            command=self._on_process,
-            state="disabled",
-            style="Accent.TButton",
-        )
-        self.btn_process.grid(row=0, column=3, sticky="e")
-
-        console_box = ttk.LabelFrame(root, text="3  Progreso", style="Section.TLabelframe")
-        console_box.grid(row=4, column=0, sticky="nsew")
-        console_box.columnconfigure(0, weight=1)
-        console_box.rowconfigure(2, weight=1)
-
-        progress_header = ttk.Frame(console_box)
-        progress_header.grid(row=0, column=0, sticky="ew")
-        progress_header.columnconfigure(0, weight=1)
-        self.lbl_status = ttk.Label(progress_header, text="Listo", style="Success.Status.TLabel")
-        self.lbl_status.grid(row=0, column=0, sticky="w")
-        ttk.Button(progress_header, text="Limpiar registro", command=self._clear_console).grid(
-            row=0, column=1, sticky="e"
-        )
-
-        self.pbar = ttk.Progressbar(console_box, orient="horizontal", mode="indeterminate")
-        self.pbar.grid(row=1, column=0, sticky="ew", pady=(10, 10))
-
-        self.txt_console = ScrolledText(console_box, height=12, wrap="word", state="disabled")
-        self.txt_console.grid(row=2, column=0, sticky="nsew")
-        self.txt_console.configure(
-            font=("Cascadia Mono", 9),
-            background="#111827",
-            foreground="#dbe5f1",
-            insertbackground="#ffffff",
-            relief="flat",
-            padx=10,
-            pady=8,
-        )
-
+        footer = ttk.Frame(root)
+        footer.grid(row=2, column=0, sticky="ew", pady=(self._px(12), 0))
+        footer.columnconfigure(0, weight=1)
+        self.lbl_summary = ttk.Label(footer, style="Field.TLabel")
+        self.lbl_summary.grid(row=0, column=0, sticky="ew", columnspan=2)
+        self.lbl_summary.bind("<Configure>", lambda e: self.lbl_summary.config(wraplength=max(1, e.width)))
+        self.pbar = ttk.Progressbar(footer, orient="horizontal", mode="determinate", maximum=1)
+        self.pbar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=self._px(7))
+        status_frame = ttk.Frame(footer, height=tkfont.nametofont("TkDefaultFont").metrics("linespace") * 2)
+        status_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
+        status_frame.grid_propagate(False)
+        status_frame.columnconfigure(0, weight=1)
+        status_frame.rowconfigure(0, weight=1)
+        self.lbl_status = ttk.Label(status_frame, text="Listo para añadir archivos", style="Status.TLabel", anchor="w")
+        self.lbl_status.grid(row=0, column=0, sticky="nsew")
+        self.lbl_status.bind("<Configure>", lambda e: self.lbl_status.config(wraplength=max(1, e.width)))
+        controls = ttk.Frame(footer)
+        controls.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(self._px(8), 0))
+        controls.columnconfigure(0, weight=1)
+        self.lbl_config = ttk.Label(controls, style="Hint.TLabel")
+        self.lbl_config.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(self._px(6), 0))
+        self.lbl_config.bind("<Configure>", lambda e: self.lbl_config.config(wraplength=max(1, e.width)))
+        self.btn_retry = ttk.Button(controls, text="Reintentar errores", command=self._on_retry)
+        self.btn_retry.grid(row=0, column=1, padx=self._px(6))
+        self.btn_stop = ttk.Button(controls, text="Detener después del actual", command=self._on_stop, state="disabled")
+        self.btn_stop.grid(row=0, column=2, padx=(0, self._px(6)))
+        self.btn_process = ttk.Button(controls, text="Procesar cola", command=self._on_process,
+                                      state="disabled", style="Accent.TButton")
+        self.btn_process.grid(row=0, column=3)
+        for variable in (self.var_model, self.var_lang, self.var_device):
+            variable.trace_add("write", lambda *_: self._update_config_summary())
+        self._update_config_summary()
         if TkinterDnD is None:
-            self._append_console(
-                "Arrastrar y soltar no está disponible porque tkinterdnd2 no está instalado. "
-                "Haz clic en la zona de selección para buscar el archivo."
-            )
+            self._append_console("Arrastrar y soltar requiere tkinterdnd2. Usa Añadir archivos o Ctrl+O.")
+
+    def _build_settings(self, parent) -> None:
+        # Dos columnas evitan comprimir los campos a DPI altos. Esta pestaña
+        # puede desplazarse sin ocultar el listado ni las acciones de la cola.
+        canvas = tk.Canvas(parent, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        content = ttk.Frame(canvas)
+        window_id = canvas.create_window(0, 0, anchor="nw", window=content)
+        content.columnconfigure(1, weight=1)
+        content.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
+        def wheel(event):
+            canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+        canvas.bind("<MouseWheel>", wheel)
+        rows = (("Modelo", "Whisper se carga una vez y se reutiliza en la cola."),
+                ("Idioma", "Código o nombre: es, español, en o auto."),
+                ("Dispositivo", "Auto elige una aceleración disponible; CPU como respaldo."))
+        self.cmb_model = ttk.Combobox(content, textvariable=self.var_model, state="readonly", width=16,
+                                      values=("turbo", "large-v3", "medium", "small", "base", "tiny"))
+        self.ent_lang = ttk.Entry(content, textvariable=self.var_lang)
+        self.cmb_device = ttk.Combobox(content, textvariable=self.var_device, state="readonly", width=16,
+                                       values=("auto", "cuda", "rocm", "xpu", "mps", "cpu"))
+        for index, ((label, hint), widget) in enumerate(zip(rows, (self.cmb_model, self.ent_lang, self.cmb_device))):
+            row = index * 3
+            ttk.Label(content, text=label, style="Field.TLabel").grid(row=row, column=0, sticky="w",
+                                                                                    padx=(0, self._px(16)))
+            widget.grid(row=row, column=1, sticky="ew")
+            hint_label = ttk.Label(content, text=hint, style="Hint.TLabel")
+            hint_label.grid(row=row+1, column=0, columnspan=2, sticky="ew", pady=(self._px(4), self._px(14)))
+            hint_label.bind("<Configure>", lambda e, w=hint_label: w.config(wraplength=max(1, e.width)))
+        self.lbl_model_hint = ttk.Label(content, text=MODEL_HINTS[DEFAULT_MODEL], style="Hint.TLabel")
+        self.lbl_model_hint.grid(row=9, column=0, columnspan=2, sticky="ew")
+        self.lbl_model_hint.bind("<Configure>", lambda e: self.lbl_model_hint.config(wraplength=max(1, e.width)))
+        self.cmb_model.bind("<<ComboboxSelected>>", self._update_model_hint)
+        self.chk_fp16 = ttk.Checkbutton(content, text="Usar FP16 en CUDA / ROCm", variable=self.var_fp16)
+        self.chk_fp16.grid(row=10, column=0, columnspan=2, sticky="w", pady=self._px(12))
+        ttk.Label(content, text="Contexto opcional", style="Field.TLabel").grid(row=11, column=0, columnspan=2, sticky="w")
+        self.ent_prompt = ttk.Entry(content, textvariable=self.var_prompt)
+        self.ent_prompt.grid(row=12, column=0, columnspan=2, sticky="ew", pady=self._px(6))
+        hint = ttk.Label(content, text="Nombres propios, siglas o vocabulario técnico. Se aplica a todos los archivos de la cola.",
+                         style="Hint.TLabel")
+        hint.grid(row=13, column=0, columnspan=2, sticky="ew")
+        hint.bind("<Configure>", lambda e: hint.config(wraplength=max(1, e.width)))
+        for widget in (content, *content.winfo_children()):
+            if not isinstance(widget, ttk.Combobox):
+                widget.bind("<MouseWheel>", wheel)
+
+    def _update_config_summary(self) -> None:
+        self.lbl_config.config(text=f"{self.var_model.get()} · {self.var_lang.get() or 'es'} · {self.var_device.get()}   |   Ctrl+O: añadir · Ctrl+Enter: procesar")
+
+    def _on_window_resize(self, event) -> None:
+        if event.widget is not self:
+            return
+        compact = event.height < self._px(650)
+        if compact == self._compact:
+            return
+        self._compact = compact
+        for widget in (self.lbl_drop, self.txt_detail, self.btn_open_folder, self.lbl_acceleration):
+            widget.grid_remove() if compact else widget.grid()
+        self.tabs.tab(0, text="Archivos · arrastra al listado" if compact else "Archivos")
 
     def _detect_acceleration(self) -> None:
         try:
@@ -825,115 +839,219 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
 
     def _set_busy(self, busy: bool) -> None:
         self._running = busy
-        state_normal = "disabled" if busy else "normal"
-        self.btn_select.config(state=state_normal)
-        self.btn_open_folder.config(
-            state=("disabled" if self._selected_file is None else state_normal)
-        )
-        self.btn_process.config(
-            state=("disabled" if busy or self._selected_file is None else "normal")
-        )
+        state = "disabled" if busy else "normal"
+        self.btn_select.config(state=state)
         self.cmb_model.config(state="disabled" if busy else "readonly")
         self.cmb_device.config(state="disabled" if busy else "readonly")
-        self.ent_lang.config(state="disabled" if busy else "normal")
-        self.ent_prompt.config(state="disabled" if busy else "normal")
-        self.chk_fp16.config(state="disabled" if busy else "normal")
+        for widget in (self.ent_lang, self.ent_prompt, self.chk_fp16, self.lbl_drop):
+            widget.config(state=state)
+        self.btn_stop.config(state="normal" if busy else "disabled")
+        self._refresh_summary()
 
-        try:
-            self.lbl_drop.config(state=state_normal)
-        except Exception:
-            pass
+    def _refresh_summary(self, counts=None) -> None:
+        counts = self._batch.summary() if counts is None else counts
+        finished = counts["completed"] + counts["error"]
+        self.lbl_summary.config(text=(
+            f"{counts['total']} archivos   ·   {counts['pending']} pendientes   ·   "
+            f"{counts['processing']} en proceso   ·   {counts['completed']} completados   ·   {counts['error']} errores"))
+        self.pbar.config(maximum=max(1, counts["total"]), value=finished)
+        self.btn_process.config(state="normal" if counts["pending"] and not self._running else "disabled",
+                                text=f"Procesar {counts['pending']} pendientes" if counts["pending"] else "Procesar cola")
+        self.btn_retry.config(state="normal" if counts["error"] and not self._running else "disabled")
+        self.btn_clear_finished.config(state="normal" if finished and not self._running else "disabled")
+        self._update_selection_controls()
 
-        if busy:
-            self.pbar.start(12)
-        else:
-            self.pbar.stop()
-
-    def _set_status(self, text: str) -> None:
+    def _set_status(self, text: str, *, error: bool = False, success: bool = False) -> None:
+        active = next((item for item in self._batch.items if item.id == self._active_item_id), None)
+        if active is not None and self._running:
+            text = f"{active.path.name} · {text}"
+            if self._stop_requested.is_set():
+                text += " · Se detendrá al terminar este archivo"
         def _apply() -> None:
             style = "Status.TLabel"
-            if "error" in text.lower():
+            if error:
                 style = "Error.Status.TLabel"
-            elif any(word in text.lower() for word in ("listo", "éxito", "terminado")):
+            elif success:
                 style = "Success.Status.TLabel"
             self.lbl_status.config(text=text, style=style)
-
         self._ui(_apply)
 
-    def _on_drop_file(self, event) -> None:
-        path_str = _parse_drop_file(self, getattr(event, "data", "") or "")
-        if not path_str:
-            return
-        self._set_selected_file(Path(path_str).expanduser())
+    def _on_drop_file(self, event) -> str:
+        if self._running:
+            return "refuse_drop"
+        self._add_files(Path(path) for path in _parse_drop_files(self, getattr(event, "data", "") or ""))
+        return "copy"
 
     def _on_select_file(self) -> None:
-        path_str = filedialog.askopenfilename(
-            parent=self,
-            title="Selecciona el audio o video",
+        if self._running:
+            return
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Selecciona uno o varios audios y videos",
             filetypes=[
-                (
-                    "Audio y video compatibles",
-                    "*.aac *.aif *.aiff *.flac *.m4a *.mp3 *.oga *.ogg *.opus *.wav *.wma "
-                    "*.mp4 *.mkv *.mov *.avi *.webm",
-                ),
+                ("Audio y video compatibles", "*.aac *.aif *.aiff *.flac *.m4a *.mp3 *.oga *.ogg *.opus *.wav *.wma *.mp4 *.mkv *.mov *.avi *.webm"),
                 ("Audio", "*.aac *.aif *.aiff *.flac *.m4a *.mp3 *.oga *.ogg *.opus *.wav *.wma"),
                 ("Videos", "*.mp4 *.mkv *.mov *.avi *.webm"),
                 ("Todos los archivos", "*.*"),
             ],
         )
-        if not path_str:
-            return
-        self._set_selected_file(Path(path_str))
+        self._add_files(Path(path) for path in paths)
 
-    def _set_selected_file(self, path: Path) -> None:
-        try:
-            path = resolve_media_file(path)
-        except Exception as exc:
-            messagebox.showwarning(APP_TITLE, str(exc), parent=self)
-            return
-
-        self._selected_file = path
-        size_mb = path.stat().st_size / (1024**2)
-        self.lbl_file.config(text=f"{path.name}  ·  {size_mb:.1f} MB\n{path.parent}")
-        self.btn_process.config(state="normal" if not self._running else "disabled")
-        self.btn_open_folder.config(state="normal" if not self._running else "disabled")
-        self._set_status("Archivo listo para procesar")
-        self._append_console(f"Archivo seleccionado: {path}")
-
-    def _on_open_folder(self) -> None:
-        if self._selected_file is None:
-            return
-        target = self._selected_file.parent
-        try:
-            open_folder(target)
-        except Exception as exc:
-            messagebox.showerror(APP_TITLE, str(exc), parent=self)
-
-    def _on_process(self) -> None:
+    def _add_files(self, paths) -> None:
         if self._running:
             return
-        if self._selected_file is None:
-            messagebox.showwarning(
-                APP_TITLE, "Selecciona primero un archivo de audio o video.", parent=self
-            )
-            return
+        valid, rejected = [], []
+        for path in paths:
+            try:
+                valid.append(resolve_media_file(Path(path).expanduser().resolve()))
+            except (OSError, ValueError) as exc:
+                rejected.append(f"{Path(path).name}: {exc}")
+        added, duplicates = self._batch.add(valid)
+        for item in added:
+            self._render_item(item)
+        if added:
+            self.tabs.select(0)
+            self.file_tree.see(added[-1].id)
+            self._set_status(f"{len(added)} añadidos · {duplicates} duplicados omitidos")
+            self._append_console(f"Añadidos {len(added)} archivos a la cola. Duplicados omitidos: {duplicates}.")
+        elif duplicates:
+            self._set_status(f"{duplicates} archivos ya están en la cola")
+        self._refresh_summary()
+        if rejected:
+            for error in rejected:
+                self._append_console(f"No se añadió: {error}")
+            preview = "\n".join(rejected[:5])
+            if len(rejected) > 5:
+                preview += f"\n… y {len(rejected)-5} más; consulta el registro."
+            messagebox.showwarning(APP_TITLE, f"Se omitieron {len(rejected)} archivos. Los compatibles se añadieron.\n\n{preview}", parent=self)
 
+    def _render_item(self, item: QueueItem) -> None:
+        labels = {"pending": "Pendiente", "processing": "En proceso", "completed": "Completado", "error": "Error"}
+        try:
+            size = f"{item.path.stat().st_size / (1024**2):.1f} MB"
+        except OSError:
+            size = "—"
+        values = (item.path.name, labels[item.status], size,
+                  f"{item.elapsed:.1f} s" if item.status in ("completed", "error") else "—", str(item.path.parent))
+        if self.file_tree.exists(item.id):
+            self.file_tree.item(item.id, values=values, tags=(item.status,))
+        else:
+            self.file_tree.insert("", "end", iid=item.id, values=values, tags=(item.status,))
+
+    def _set_file_detail(self, text: str) -> None:
+        self.txt_detail.config(state="normal")
+        self.txt_detail.delete("1.0", "end")
+        self.txt_detail.insert("1.0", text)
+        self.txt_detail.config(state="disabled")
+
+    def _on_tree_select(self, _event=None) -> None:
+        self._update_selection_controls()
+        selected = self.file_tree.selection()
+        if not selected:
+            self._set_file_detail("Selecciona una fila para ver la ruta y los resultados. Ctrl o Mayús permiten seleccionar varias.")
+            return
+        item = next((item for item in self._batch.items if item.id == selected[0]), None)
+        if item is None:
+            return
+        detail = str(item.path)
+        if item.error:
+            detail += f"\nError: {item.error}"
+        elif item.outputs:
+            detail += "\nGenerados: " + " · ".join(path.name for path in item.outputs)
+        self._set_file_detail(detail)
+
+    def _update_selection_controls(self) -> None:
+        selected = bool(self.file_tree.selection())
+        self.btn_remove.config(state="normal" if selected and not self._running else "disabled")
+        self.btn_open_folder.config(state="normal" if selected else "disabled")
+
+    def _remove_items_from_view(self, removed) -> None:
+        for item in removed:
+            self.file_tree.delete(item.id)
+        self._refresh_summary()
+        self._on_tree_select()
+        if not self._batch.items:
+            self._set_status("Listo para añadir archivos")
+
+    def _on_remove(self) -> None:
+        if not self._running:
+            self._remove_items_from_view(self._batch.remove(self.file_tree.selection()))
+
+    def _on_clear_finished(self) -> None:
+        if not self._running:
+            self._remove_items_from_view(self._batch.clear_finished())
+
+    def _on_retry(self) -> None:
+        if self._running:
+            return
+        for item in self._batch.items:
+            if item.status == "error":
+                item.status, item.error, item.elapsed = "pending", "", 0.0
+                self._render_item(item)
+        self._on_process()
+
+    def _on_open_folder(self) -> None:
+        selected = self.file_tree.selection()
+        item = next((item for item in self._batch.items if selected and item.id == selected[0]), None)
+        if item:
+            try:
+                open_folder(item.path.parent)
+            except Exception as exc:
+                messagebox.showerror(APP_TITLE, str(exc), parent=self)
+
+    def _on_stop(self) -> None:
+        if self._running:
+            self._stop_requested.set()
+            self.btn_stop.config(state="disabled")
+            self._set_status("Se detendrá la cola al terminar el archivo actual")
+
+    def _on_process(self) -> None:
+        if self._running or not self._batch.summary()["pending"]:
+            return
+        self._stop_requested.clear()
+        self._active_item_id = None
         self._set_busy(True)
-        self._set_status("Procesando")
-        self._append_console("Iniciando transcripción...")
-        media_file = self._selected_file
-        model_size = self.var_model.get().strip() or DEFAULT_MODEL
-        lang = self.var_lang.get().strip() or DEFAULT_LANG
-        initial_prompt = self.var_prompt.get().strip() or None
-        requested_device = self.var_device.get().strip().lower() or "auto"
-        use_fp16 = bool(self.var_fp16.get())
+        self._set_status("Preparando cola")
+        self._append_console("Iniciando cola de transcripción…")
+        self.tabs.select(0)
         worker = threading.Thread(
             target=self._worker_process,
-            args=(media_file, model_size, lang, requested_device, use_fp16, initial_prompt),
-            daemon=True,
-            name="whisper-transcription",
-        )
+            args=(self.var_model.get().strip() or DEFAULT_MODEL,
+                  self.var_lang.get().strip() or DEFAULT_LANG,
+                  self.var_device.get().strip().lower() or "auto", bool(self.var_fp16.get()),
+                  self.var_prompt.get().strip() or None),
+            daemon=True, name="whisper-transcription-queue")
         worker.start()
+
+    def _on_item_changed(self, item: QueueItem) -> None:
+        # Congela el estado antes de pasarlo al hilo Tk: el worker puede avanzar
+        # al siguiente archivo antes de que se vacíe la cola de eventos.
+        from dataclasses import replace
+        snapshot = replace(item)
+        counts = self._batch.summary()
+        if item.status == "processing":
+            self._active_item_id = item.id
+        def apply():
+            self._render_item(snapshot)
+            self._refresh_summary(counts)
+            if snapshot.status == "processing":
+                self.file_tree.see(snapshot.id)
+            if snapshot.id in self.file_tree.selection():
+                self._on_tree_select()
+        self._ui(apply)
+
+    def _finish_batch(self, started_at: float, setup_error: str = "") -> None:
+        self._active_item_id = None
+        self._set_busy(False)
+        counts = self._batch.summary()
+        finished = counts['completed'] + counts['error']
+        if setup_error:
+            self._set_status(f"Error al preparar la cola: {setup_error}", error=True)
+        else:
+            prefix = "Cola detenida" if counts["pending"] else "Cola terminada"
+            self._set_status(
+                f"{prefix} · {finished}/{counts['total']} finalizados · {counts['completed']} completados · {counts['error']} errores",
+                error=bool(counts["error"]), success=not counts["pending"] and not counts["error"])
+        self._append_console(f"Tiempo de esta ejecución: {time.perf_counter()-started_at:.1f} s")
 
     def _resolve_device(self, requested_device: str, use_fp16: bool) -> tuple[str, bool]:
         torch_module = load_torch()
@@ -965,58 +1083,63 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
         return model
 
     def _worker_process(
-        self,
-        media_file: Path,
-        model_size: str,
-        lang: str,
-        requested_device: str,
-        use_fp16: bool,
-        initial_prompt: Optional[str],
+        self, model_size: str, lang: str, requested_device: str,
+        use_fp16: bool, initial_prompt: Optional[str],
     ) -> None:
         started_at = time.perf_counter()
-        device = "cpu"
+        setup_error = ""
         try:
-            self._set_status("Cargando dependencias")
-            self._append_console("Cargando dependencias (torch/whisper)...")
+            self._set_status("Cargando dependencias y comprobando configuración")
             whisper_module = load_whisper()
-
-            media_file = resolve_media_file(media_file)
             require_ffmpeg()
-            audio_stream = probe_audio_stream(media_file)
+            require_ffprobe()
             language = normalize_language(whisper_module, lang)
             device, use_fp16 = self._resolve_device(requested_device, use_fp16)
+            self._output_plan = plan_output_paths(self._batch.items)
 
-            media_kind = (
-                "Audio" if media_file.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS else "Video"
+            def process_item(item):
+                nonlocal device, use_fp16
+                outputs = self._transcribe_item(item, whisper_module, model_size, language,
+                                                device, use_fp16, initial_prompt)
+                # Si la GPU requirió respaldo, conserva CPU durante este lote
+                # para reutilizar el modelo y evitar otro fallo por archivo.
+                if self._loaded_model_key == (model_size, "cpu") and device != "cpu":
+                    device, use_fp16 = "cpu", False
+                return outputs
+
+            self._batch.run(
+                process_item,
+                self._on_item_changed,
+                lambda: self._stop_requested.is_set() or self._closing,
             )
-            self._append_console(f"{media_kind}: {media_file.name}")
-            self._append_console(f"Modelo: {model_size}")
-            self._append_console(f"Tamaño: {media_file.stat().st_size / (1024 ** 2):.1f} MB")
-            self._append_console(f"Idioma: {language or 'detección automática'}")
-            self._append_console(f"Dispositivo: {device}")
-            self._append_console(f"FP16: {'Sí' if use_fp16 else 'No'}")
+        except Exception as exc:
+            setup_error = str(exc)
+            self._append_console(f"Error al preparar la cola: {setup_error}\n{traceback.format_exc()}")
+        finally:
+            self._ui(lambda: self._finish_batch(started_at, setup_error))
+
+    def _transcribe_item(
+        self, item: QueueItem, whisper_module, model_size: str, language: Optional[str],
+        device: str, use_fp16: bool, initial_prompt: Optional[str],
+    ) -> tuple[Path, Path]:
+        started_at = time.perf_counter()
+        try:
+            self._set_status("Comprobando pista de audio")
+            media_file = resolve_media_file(item.path)
+            audio_stream = probe_audio_stream(media_file)
+            media_kind = "Audio" if media_file.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS else "Video"
+            self._append_console(f"\n{media_kind}: {media_file}")
+            self._append_console(f"Modelo: {model_size} · Idioma: {language or 'detección automática'} · Dispositivo: {device}")
             self._append_console(
-                "Pista: "
-                f"{audio_stream.get('codec_name', 'desconocido')} · "
-                f"{audio_stream.get('channels', '?')} canal(es) · "
-                f"{audio_stream.get('sample_rate', '?')} Hz"
-            )
-            if initial_prompt:
-                self._append_console("Se usará el contexto indicado para nombres y vocabulario.")
-
+                f"Pista: {audio_stream.get('codec_name', '?')} · "
+                f"{audio_stream.get('channels', '?')} canal(es) · {audio_stream.get('sample_rate', '?')} Hz")
             torch_module = load_torch()
-            self._append_console(
-                f"Versiones: Whisper {getattr(whisper_module, '__version__', 'desconocida')} · "
-                f"PyTorch {getattr(torch_module, '__version__', 'desconocida')}"
-            )
-            self._append_console(f"Procesador: {device_description(torch_module, device)}")
+            self._append_console(f"Procesador: {device_description(torch_module, device)} · FP16: {'Sí' if use_fp16 else 'No'}")
 
             def transcribe_on_device(target_device, fp16):
                 self._set_status("Cargando modelo")
-                self._append_console(f"Cargando modelo Whisper en {target_device}...")
                 model = self._get_model(whisper_module, model_size, target_device)
                 self._set_status("Transcribiendo audio")
-                self._append_console(f"Transcribiendo {media_kind.lower()} en {target_device}...")
                 with torch_module.inference_mode():
                     return transcribe_media(model, media_file, language, fp16, initial_prompt)
 
@@ -1025,42 +1148,25 @@ class Video2TextApp(TkinterDnD.Tk if TkinterDnD else tk.Tk):
                 clear_device_cache(torch_module, device)
 
             result, device = run_with_cpu_fallback(
-                transcribe_on_device, device, use_fp16,
-                release_failed_model, self._append_console,
-            )
+                transcribe_on_device, device, use_fp16, release_failed_model, self._append_console)
             self._append_console(f"Dispositivo utilizado: {device}")
-
-            self._set_status("Guardando resultados")
-            txt_file, srt_file = save_transcript_outputs(media_file, result)
-
-            self._append_console(f"TXT generado: {txt_file}")
-            self._append_console(f"SRT generado: {srt_file}")
-            self._append_console(f"Tiempo total: {time.perf_counter() - started_at:.1f} s")
-            self._set_status("Proceso terminado con éxito")
-
-            self._ui(
-                lambda: messagebox.showinfo(
-                    APP_TITLE,
-                    "Proceso finalizado exitosamente.\n\n"
-                    f"TXT: {txt_file}\n"
-                    f"SRT: {srt_file}",
-                    parent=self,
-                )
-            )
+            self._set_status("Guardando TXT y SRT")
+            outputs = save_transcript_outputs(media_file, result, output_paths=self._output_plan[item.id])
+            for output in outputs:
+                self._append_console(f"Generado: {output}")
+            self._append_console(f"Completado en {time.perf_counter() - started_at:.1f} s")
+            return outputs
         except Exception as exc:
             diagnostic = traceback.format_exc()
-            error_message = str(exc)
-            if "out of memory" in error_message.lower():
-                error_message = (
-                    "No hay memoria suficiente. Prueba un modelo más pequeño, como 'base'."
-                )
-                clear_device_cache(load_torch(), device)
-            self._append_console(f"Error: {error_message}")
-            self._append_console(f"Detalles técnicos:\n{diagnostic}")
-            self._set_status("Error")
-            self._ui(lambda msg=error_message: messagebox.showerror(APP_TITLE, msg, parent=self))
-        finally:
-            self._ui(lambda: self._set_busy(False))
+            message = str(exc)
+            if "out of memory" in message.lower():
+                message = "No hay memoria suficiente. Prueba un modelo más pequeño, como 'base'."
+                try:
+                    clear_device_cache(load_torch(), device)
+                except Exception:
+                    pass
+            self._append_console(f"Error en {item.path.name}: {message}\nDetalles técnicos:\n{diagnostic}")
+            raise RuntimeError(message) from exc
 
 
 def check_dependencies() -> dict:

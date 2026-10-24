@@ -70,9 +70,30 @@ Al ejecutar este comando se abre una ventana. Mientras la ventana siga abierta,
 PowerShell no mostrará un nuevo prompt: eso es normal y significa que la
 aplicación está ejecutándose.
 
-La aplicación permite seleccionar o arrastrar archivos de audio y video. Whisper
-transcribe el audio y genera archivos `.txt` y `.srt` en la misma carpeta y con
-el mismo nombre base que el archivo original.
+Puedes seleccionar o arrastrar varios archivos de audio y video, incluso
+mezclados, para añadirlos a la cola. Los duplicados se omiten. Al procesar,
+Whisper transcribe los pendientes uno después de otro; si un archivo falla,
+continúa con el siguiente. La configuración elegida se conserva durante esa
+ejecución y la cola no se puede editar hasta que termine o se detenga.
+
+La tabla muestra el estado de cada archivo y los contadores acumulan pendientes,
+en proceso, completados y errores. La barra avanza por archivos finalizados,
+incluidos los que terminaron con error. **Detener después del actual** deja los
+restantes pendientes; **Reintentar errores** permite volver a procesar los que
+fallaron. **Limpiar finalizados** elimina sus filas de la cola sin borrar archivos.
+
+Las salidas `.txt` y `.srt` se guardan junto al original con su mismo nombre base.
+Si dos archivos de la cola comparten carpeta y nombre base, pero tienen distinta
+extensión, sus salidas conservan también esa extensión, por ejemplo
+`entrevista.mp3.txt` y `entrevista.mp3.srt`, para evitar colisiones.
+Las rutas ya completadas se conservan; si sigue existiendo una coincidencia,
+se añade un sufijo numérico a las nuevas salidas.
+
+Las pestañas **Archivos**, **Configuración** y **Registro** mantienen accesible la
+interfaz en ventanas pequeñas. Al iniciar, la aplicación respeta el escalado de
+Windows, incluido el 100 % y el 150 %, y adapta el tamaño del texto y los controles.
+En ventanas bajas se simplifica la vista: puedes arrastrar directamente al
+listado y hacer doble clic en una fila para abrir su carpeta.
 
 Formatos admitidos:
 
@@ -242,9 +263,10 @@ siguientes ejecuciones con el mismo modelo y dispositivo comienzan más rápido.
 
 ## Atajos de la interfaz
 
-- `Ctrl+O`: buscar o cambiar el archivo de audio o video.
-- `Ctrl+Enter`: iniciar la transcripción.
-- Haz clic en la zona **Arrastra el audio o video aquí** para abrir el selector.
+- `Ctrl+O`: seleccionar uno o varios archivos y añadirlos a la cola.
+- `Ctrl+Enter`: procesar los archivos pendientes.
+- Haz clic en la zona de arrastre para abrir el selector; usa `Ctrl` o `Mayús`
+  para seleccionar varios archivos.
 - **Limpiar registro** vacía la consola visual sin borrar archivos generados.
 
 ## Validación y pruebas
